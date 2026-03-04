@@ -317,7 +317,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                     }
                 }
             }
-            drain_path_events(cnx, &mut resolvers, state_ptr);
+            drain_path_events(cnx, &mut resolvers, state_ptr, &mut balancer);
 
             // Hot-add resolvers discovered by the background scanner.
             if let Some(rx) = scanner_rx.as_mut() {
@@ -467,7 +467,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
 
             drain_commands(cnx, state_ptr, &mut command_rx);
             drain_stream_data(cnx, state_ptr);
-            drain_path_events(cnx, &mut resolvers, state_ptr);
+            drain_path_events(cnx, &mut resolvers, state_ptr, &mut balancer);
 
             'send: for _ in 0..packet_loop_send_max {
                 let current_time = unsafe { picoquic_current_time() };

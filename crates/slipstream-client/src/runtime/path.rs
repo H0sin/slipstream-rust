@@ -1,6 +1,6 @@
 use crate::dns::{
     refresh_resolver_path, reset_resolver_path, resolver_mode_to_c,
-    sockaddr_storage_to_socket_addr, ResolverState,
+    sockaddr_storage_to_socket_addr, DomainBalancer, ResolverState,
 };
 use crate::error::ClientError;
 use crate::streams::{ClientState, PathEvent};
@@ -12,6 +12,7 @@ use slipstream_ffi::picoquic::{
 };
 use slipstream_ffi::ResolverMode;
 use std::net::SocketAddr;
+use tracing::info;
 
 const AUTHORITATIVE_LOOP_MULTIPLIER: usize = 4;
 
@@ -51,6 +52,7 @@ pub(crate) fn drain_path_events(
     cnx: *mut picoquic_cnx_t,
     resolvers: &mut [ResolverState],
     state_ptr: *mut ClientState,
+    balancer: &mut DomainBalancer,
 ) {
     if state_ptr.is_null() {
         return;
@@ -63,13 +65,15 @@ pub(crate) fn drain_path_events(
         match event {
             PathEvent::Available(unique_path_id) => {
                 if let Some(addr) = path_peer_addr(cnx, unique_path_id) {
-                    if let Some(resolver) = find_resolver_by_addr_mut(resolvers, addr) {
+                    if let Some((idx, resolver)) = find_resolver_by_addr_with_index(resolvers, addr) {
                         let path_id =
                             unsafe { slipstream_get_path_id_from_unique(cnx, unique_path_id) };
                         if path_id >= 0 {
                             resolver.unique_path_id = Some(unique_path_id);
                             resolver.path_id = path_id;
                             resolver.added = true;
+                            // Path came back — unsuspend in balancer.
+                            balancer.unsuspend_resolver(idx);
                         } else {
                             resolver.unique_path_id = None;
                         }
@@ -77,8 +81,14 @@ pub(crate) fn drain_path_events(
                 }
             }
             PathEvent::Deleted(unique_path_id) => {
-                if let Some(resolver) = find_resolver_by_unique_id_mut(resolvers, unique_path_id) {
+                if let Some((idx, resolver)) = find_resolver_by_unique_id_with_index(resolvers, unique_path_id) {
                     reset_resolver_path(resolver);
+                    // Path lost — suspend all routes for this resolver.
+                    info!(
+                        "Path deleted for resolver {} (idx={}) — suspending in balancer",
+                        resolver.addr, idx
+                    );
+                    balancer.suspend_resolver(idx);
                 }
             }
         }
@@ -119,6 +129,17 @@ pub(crate) fn find_resolver_by_addr_mut(
     resolvers.iter_mut().find(|resolver| resolver.addr == addr)
 }
 
+fn find_resolver_by_addr_with_index(
+    resolvers: &mut [ResolverState],
+    addr: SocketAddr,
+) -> Option<(usize, &mut ResolverState)> {
+    let addr = normalize_dual_stack_addr(addr);
+    resolvers
+        .iter_mut()
+        .enumerate()
+        .find(|(_, resolver)| resolver.addr == addr)
+}
+
 fn find_resolver_by_unique_id_mut(
     resolvers: &mut [ResolverState],
     unique_path_id: u64,
@@ -126,4 +147,14 @@ fn find_resolver_by_unique_id_mut(
     resolvers
         .iter_mut()
         .find(|resolver| resolver.unique_path_id == Some(unique_path_id))
+}
+
+fn find_resolver_by_unique_id_with_index(
+    resolvers: &mut [ResolverState],
+    unique_path_id: u64,
+) -> Option<(usize, &mut ResolverState)> {
+    resolvers
+        .iter_mut()
+        .enumerate()
+        .find(|(_, resolver)| resolver.unique_path_id == Some(unique_path_id))
 }
