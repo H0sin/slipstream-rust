@@ -225,6 +225,30 @@ impl DomainBalancer {
         new_idx
     }
 
+    /// Ensure the balancer has routes for exactly `count` resolvers.
+    ///
+    /// Existing routes (and their health state) are preserved.  If
+    /// `count` is greater than `num_resolvers`, fresh routes are added.
+    /// If `count` is smaller, excess routes are trimmed.
+    pub(crate) fn resize_resolvers(&mut self, count: usize) {
+        if count == self.num_resolvers {
+            return;
+        }
+        if count > self.num_resolvers {
+            while self.num_resolvers < count {
+                self.add_resolver();
+            }
+        } else {
+            // Trim routes belonging to removed resolvers.
+            self.routes.retain(|r| r.resolver_idx < count);
+            self.num_resolvers = count;
+        }
+        // Keep cursor in bounds.
+        if self.rr_cursor >= self.routes.len() {
+            self.rr_cursor = 0;
+        }
+    }
+
     /// Returns the domain string for a given index.
     pub(crate) fn domain(&self, idx: usize) -> &str {
         &self.domains[idx]

@@ -159,13 +159,24 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
         });
     }
 
+    // Create balancer ONCE before the reconnect loop so that health
+    // state (suspended resolvers, cooldowns) is preserved across
+    // reconnects.  It will be resized inside the loop if the resolver
+    // list changes.
+    let initial_resolvers = resolve_resolvers(config.resolvers, mtu, config.debug_poll)?;
+    if initial_resolvers.is_empty() {
+        return Err(ClientError::new("At least one resolver is required"));
+    }
+    let mut balancer = DomainBalancer::new(config.domains, initial_resolvers.len());
+    drop(initial_resolvers); // Only needed for the count; re-resolved inside loop.
+
     loop {
         let mut resolvers = resolve_resolvers(config.resolvers, mtu, config.debug_poll)?;
         if resolvers.is_empty() {
             return Err(ClientError::new("At least one resolver is required"));
         }
 
-        let mut balancer = DomainBalancer::new(config.domains, resolvers.len());
+        balancer.resize_resolvers(resolvers.len());
         info!("Domain balancer initialised: {}", balancer.summary());
 
         let mut local_addr_storage = socket_addr_to_storage(udp.local_addr().map_err(map_io)?);
