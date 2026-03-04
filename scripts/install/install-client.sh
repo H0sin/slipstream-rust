@@ -7,7 +7,7 @@
 #    curl -sSL http://IRAN_WEBSERVER_IP:PORT/install-client.sh | sudo bash
 #
 #  After install, manage with:
-#    slipstream-cli  status|start|stop|restart|logs|edit|uninstall
+#    slipstream-cli  status|start|stop|restart|logs|edit|update|uninstall
 # ─────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -131,6 +131,31 @@ EOFSVC
       systemctl restart "$SERVICE_NAME"
       info "Config updated and client restarted."
       ;;
+    update)
+      [[ $EUID -ne 0 ]] && { err "Run as root: sudo slipstream-cli update"; exit 1; }
+      # Determine download URL from saved config or default
+      if [[ -f "$CONF_FILE" ]]; then
+        source "$CONF_FILE"
+      fi
+      DL_BASE="${DOWNLOAD_BASE:-$DEFAULT_DOWNLOAD_BASE}"
+      DL_BASE="${DL_BASE%/}"
+      echo ""
+      info "Updating slipstream-client binary from $DL_BASE ..."
+      TMP_BIN=$(mktemp)
+      if curl -sSL --max-time 120 "${DL_BASE}/slipstream-client" -o "$TMP_BIN"; then
+        systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+        mv -f "$TMP_BIN" "$BIN_DIR/slipstream-client"
+        chmod +x "$BIN_DIR/slipstream-client"
+        systemctl start "$SERVICE_NAME"
+        info "Binary updated and client restarted."
+        # Also update the management script itself
+        curl -sSL --max-time 30 "${DL_BASE}/install-client.sh" -o "$MANAGE_CMD" 2>/dev/null && chmod +x "$MANAGE_CMD" || true
+      else
+        rm -f "$TMP_BIN"
+        err "Download failed. Client unchanged."
+        exit 1
+      fi
+      ;;
     uninstall)
       echo ""
       ask "Are you sure? This removes slipstream-client completely. (y/n)"
@@ -148,7 +173,7 @@ EOFSVC
       fi
       ;;
     *)
-      echo "Usage: slipstream-cli {status|start|stop|restart|logs|edit|uninstall}"
+      echo "Usage: slipstream-cli {status|start|stop|restart|logs|edit|update|uninstall}"
       exit 1
       ;;
   esac
@@ -178,6 +203,7 @@ if [[ -f "$BIN_DIR/slipstream-client" ]] && [[ -f "/etc/systemd/system/${SERVICE
   echo -e "  slipstream-cli restart    Restart the client"
   echo -e "  slipstream-cli logs       Follow live logs"
   echo -e "  slipstream-cli edit       Edit configuration"
+  echo -e "  slipstream-cli update     Download latest binary"
   echo -e "  slipstream-cli uninstall  Remove slipstream"
   echo ""
   exit 0
@@ -281,6 +307,7 @@ echo -e "  slipstream-cli status"
 echo -e "  slipstream-cli restart"
 echo -e "  slipstream-cli logs"
 echo -e "  slipstream-cli edit"
+echo -e "  slipstream-cli update"
 echo -e "  slipstream-cli stop"
 echo -e "  slipstream-cli uninstall"
 echo ""

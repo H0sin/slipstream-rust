@@ -582,23 +582,51 @@ pub(crate) async fn run_scanner(
     }
 }
 
+/// How often (in number of probes dispatched) we log a progress line.
+const SCAN_PROGRESS_INTERVAL: usize = 10_000;
+
 /// Scan a batch of candidates with bounded concurrency.
 async fn scan_batch(targets: &[SocketAddr], domains: &[String]) -> Vec<DiscoveredResolver> {
     use tokio::sync::Semaphore;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
+    let total = targets.len();
     let semaphore = Arc::new(Semaphore::new(SCAN_CONCURRENCY));
     let domains = Arc::new(domains.to_vec());
-    let mut handles = Vec::with_capacity(targets.len());
+    let completed = Arc::new(AtomicUsize::new(0));
+    let found = Arc::new(AtomicUsize::new(0));
+    let mut handles = Vec::with_capacity(total);
+    let scan_start = Instant::now();
 
     for (i, &addr) in targets.iter().enumerate() {
+        // Log progress every SCAN_PROGRESS_INTERVAL probes dispatched.
+        if i > 0 && i % SCAN_PROGRESS_INTERVAL == 0 {
+            let done = completed.load(Ordering::Relaxed);
+            let hits = found.load(Ordering::Relaxed);
+            let elapsed = scan_start.elapsed().as_secs();
+            info!(
+                "[scanner] progress: dispatched {}/{} ({:.1}%), completed ~{}, found {} working  [{}s]",
+                i, total, (i as f64 / total as f64) * 100.0, done, hits, elapsed,
+            );
+        }
+
         let permit = semaphore.clone().acquire_owned().await;
         let domains = domains.clone();
+        let completed = completed.clone();
+        let found = found.clone();
         let handle = tokio::spawn(async move {
             let _permit = permit;
             let base_id = ((i as u32) % 65536) as u16;
             let result = probe_with_retries(addr, &domains, base_id).await;
-            result.map(|latency| DiscoveredResolver { addr, latency })
+            completed.fetch_add(1, Ordering::Relaxed);
+            match result {
+                Some(latency) => {
+                    found.fetch_add(1, Ordering::Relaxed);
+                    Some(DiscoveredResolver { addr, latency })
+                }
+                None => None,
+            }
         });
         handles.push(handle);
     }
@@ -613,6 +641,16 @@ async fn scan_batch(targets: &[SocketAddr], domains: &[String]) -> Vec<Discovere
             }
         }
     }
+
+    let elapsed = scan_start.elapsed();
+    info!(
+        "[scanner] batch complete: {}/{} probed, {} found in {:.1}s ({:.0} probes/s)",
+        completed.load(Ordering::Relaxed),
+        total,
+        discovered.len(),
+        elapsed.as_secs_f64(),
+        total as f64 / elapsed.as_secs_f64().max(0.001),
+    );
 
     // Sort by latency — fastest first.
     discovered.sort_by_key(|r| r.latency);

@@ -8,7 +8,7 @@
 #    curl -sSL https://raw.githubusercontent.com/alisamani1378/slipstream-server-installer/main/install.sh | sudo bash
 #
 #  After install, manage with:
-#    slipstream  status|start|stop|restart|logs|edit|uninstall
+#    slipstream  status|start|stop|restart|logs|edit|update|uninstall
 # ─────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -152,6 +152,25 @@ EOFSVC
       systemctl restart "$SERVICE_NAME"
       info "Config updated and server restarted."
       ;;
+    update)
+      [[ $EUID -ne 0 ]] && { err "Run as root: sudo slipstream update"; exit 1; }
+      echo ""
+      info "Updating slipstream-server binary..."
+      TMP_BIN=$(mktemp)
+      if curl -sSL --max-time 120 "${RELEASE_BASE}/slipstream-server" -o "$TMP_BIN"; then
+        systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+        mv -f "$TMP_BIN" "$BIN_DIR/slipstream-server"
+        chmod +x "$BIN_DIR/slipstream-server"
+        systemctl start "$SERVICE_NAME"
+        info "Binary updated and server restarted."
+        # Also update the management script itself
+        curl -sSL --max-time 30 "${RELEASE_BASE}/install.sh" -o "$MANAGE_CMD" 2>/dev/null && chmod +x "$MANAGE_CMD" || true
+      else
+        rm -f "$TMP_BIN"
+        err "Download failed. Server unchanged."
+        exit 1
+      fi
+      ;;
     uninstall)
       echo ""
       ask "Are you sure? This removes slipstream-server completely. (y/n)"
@@ -169,7 +188,7 @@ EOFSVC
       fi
       ;;
     *)
-      echo "Usage: slipstream {status|start|stop|restart|logs|edit|uninstall}"
+      echo "Usage: slipstream {status|start|stop|restart|logs|edit|update|uninstall}"
       exit 1
       ;;
   esac
@@ -198,6 +217,7 @@ if [[ -f "$BIN_DIR/slipstream-server" ]] && [[ -f "/etc/systemd/system/${SERVICE
   echo -e "  slipstream restart    Restart the server"
   echo -e "  slipstream logs       Follow live logs"
   echo -e "  slipstream edit       Edit configuration"
+  echo -e "  slipstream update     Download latest binary"
   echo -e "  slipstream uninstall  Remove slipstream"
   echo ""
   exit 0
@@ -312,6 +332,7 @@ echo -e "  slipstream status"
 echo -e "  slipstream restart"
 echo -e "  slipstream logs"
 echo -e "  slipstream edit"
+echo -e "  slipstream update"
 echo -e "  slipstream stop"
 echo -e "  slipstream uninstall"
 echo ""

@@ -169,6 +169,9 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
     }
     let mut balancer = DomainBalancer::new(config.domains, initial_resolvers.len());
     drop(initial_resolvers); // Only needed for the count; re-resolved inside loop.
+    info!("Domain balancer created: {}", balancer.summary());
+
+    let mut reconnect_count: u64 = 0;
 
     loop {
         let mut resolvers = resolve_resolvers(config.resolvers, mtu, config.debug_poll)?;
@@ -177,7 +180,14 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
         }
 
         balancer.resize_resolvers(resolvers.len());
-        info!("Domain balancer initialised: {}", balancer.summary());
+        if reconnect_count > 0 {
+            info!(
+                "Reconnect #{}: balancer state preserved — {}",
+                reconnect_count,
+                balancer.summary(),
+            );
+        }
+        reconnect_count += 1;
 
         let mut local_addr_storage = socket_addr_to_storage(udp.local_addr().map_err(map_io)?);
 
