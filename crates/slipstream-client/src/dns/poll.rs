@@ -1,18 +1,20 @@
 use crate::error::ClientError;
 use slipstream_core::net::is_transient_udp_error;
 use slipstream_dns::{build_qname, encode_query, QueryParams, CLASS_IN, RR_TXT};
+use tracing::warn;
 use slipstream_ffi::picoquic::{
     picoquic_cnx_t, picoquic_current_time, picoquic_prepare_packet_ex, slipstream_request_poll,
 };
-use slipstream_ffi::{ClientConfig, ResolverMode};
+use slipstream_ffi::ResolverMode;
 use std::collections::HashMap;
 use tokio::net::UdpSocket as TokioUdpSocket;
 
+use super::balancer::DomainBalancer;
 use super::path::refresh_resolver_path;
 use super::resolver::{sockaddr_storage_to_socket_addr, ResolverState};
 use slipstream_core::normalize_dual_stack_addr;
 
-const AUTHORITATIVE_POLL_TIMEOUT_US: u64 = 5_000_000;
+const AUTHORITATIVE_POLL_TIMEOUT_US: u64 = 2_000_000;
 
 pub(crate) fn expire_inflight_polls(inflight_poll_ids: &mut HashMap<u16, u64>, now: u64) {
     if inflight_poll_ids.is_empty() {
@@ -34,7 +36,8 @@ pub(crate) fn expire_inflight_polls(inflight_poll_ids: &mut HashMap<u16, u64>, n
 pub(crate) async fn send_poll_queries(
     cnx: *mut picoquic_cnx_t,
     udp: &TokioUdpSocket,
-    config: &ClientConfig<'_>,
+    balancer: &mut DomainBalancer,
+    resolver_idx: usize,
     local_addr_storage: &mut libc::sockaddr_storage,
     dns_id: &mut u16,
     resolver: &mut ResolverState,
@@ -72,7 +75,8 @@ pub(crate) async fn send_poll_queries(
             )
         };
         if ret < 0 {
-            return Err(ClientError::new("Failed preparing poll packet"));
+            warn!("Failed preparing poll packet (ret={ret}); stopping poll burst");
+            return Ok(());
         }
         if send_length == 0 || addr_to.ss_family == 0 {
             *remaining = remaining_count;
@@ -87,8 +91,15 @@ pub(crate) async fn send_poll_queries(
         resolver.debug.polls_sent = resolver.debug.polls_sent.saturating_add(1);
 
         let poll_id = *dns_id;
-        let qname = build_qname(&send_buf[..send_length], config.domain)
-            .map_err(|err| ClientError::new(err.to_string()))?;
+        let domain_idx = balancer.select_domain_for_resolver(resolver_idx).unwrap_or(0);
+        let selected_domain = balancer.domain(domain_idx);
+        let qname = match build_qname(&send_buf[..send_length], selected_domain) {
+            Ok(q) => q,
+            Err(err) => {
+                warn!("Failed to build poll qname: {err}; skipping packet");
+                continue;
+            }
+        };
         let params = QueryParams {
             id: poll_id,
             qname: &qname,
@@ -100,17 +111,29 @@ pub(crate) async fn send_poll_queries(
             is_query: true,
         };
         *dns_id = dns_id.wrapping_add(1);
-        let packet = encode_query(&params).map_err(|err| ClientError::new(err.to_string()))?;
+        let packet = match encode_query(&params) {
+            Ok(p) => p,
+            Err(err) => {
+                warn!("Failed to encode poll query: {err}; skipping packet");
+                continue;
+            }
+        };
 
-        let dest = sockaddr_storage_to_socket_addr(&addr_to)?;
-        let dest = normalize_dual_stack_addr(dest);
+        let dest = match sockaddr_storage_to_socket_addr(&addr_to) {
+            Ok(d) => normalize_dual_stack_addr(d),
+            Err(err) => {
+                warn!("Failed to parse poll dest address: {err}; skipping packet");
+                continue;
+            }
+        };
         if let Err(err) = udp.send_to(&packet, dest).await {
             if is_transient_udp_error(&err) {
                 remaining_count = remaining_count.saturating_add(1);
                 *remaining = remaining_count;
                 break;
             }
-            return Err(ClientError::new(err.to_string()));
+            warn!("Non-transient UDP send error in poll: {err}; stopping poll burst");
+            return Ok(());
         }
         if resolver.mode == ResolverMode::Authoritative {
             resolver.inflight_poll_ids.insert(poll_id, current_time);

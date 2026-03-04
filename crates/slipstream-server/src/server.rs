@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 use tokio::net::UdpSocket as TokioUdpSocket;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
+use tracing::warn;
 
 use crate::streams::{
     drain_commands, handle_command, handle_shutdown, maybe_report_command_stats,
@@ -34,10 +35,10 @@ use crate::streams::{
 // Protocol defaults; see docs/config.md for details.
 const SLIPSTREAM_ALPN: &str = "picoquic_sample";
 const DNS_MAX_QUERY_SIZE: usize = 512;
-const IDLE_SLEEP_MS: u64 = 10;
+const IDLE_SLEEP_MS: u64 = 2;
 const IDLE_GC_INTERVAL: Duration = Duration::from_secs(1);
 // Default QUIC MTU for server packets; see docs/config.md for details.
-const QUIC_MTU: u32 = 900;
+const QUIC_MTU: u32 = 1200;
 pub(crate) const STREAM_READ_CHUNK_BYTES: usize = 4096;
 pub(crate) const DEFAULT_TCP_RCVBUF_BYTES: usize = 256 * 1024;
 pub(crate) const TARGET_WRITE_COALESCE_DEFAULT_BYTES: usize = 256 * 1024;
@@ -314,25 +315,32 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
                             current_time: loop_time,
                             local_addr_storage: &local_addr_storage,
                         };
-                        handle_packet(
+                        if let Err(e) = handle_packet(
                             &mut slots,
                             &recv_buf[..size],
                             peer,
                             &context,
                             &mut fallback_mgr,
                         )
-                        .await?;
+                        .await
+                        {
+                            warn!("Failed to handle packet from {peer}: {e}; skipping");
+                        }
                         for _ in 1..PICOQUIC_PACKET_LOOP_RECV_MAX {
                             match udp.try_recv_from(&mut recv_buf) {
                                 Ok((size, peer)) => {
-                                    handle_packet(
+                                    if let Err(e) = handle_packet(
                                         &mut slots,
                                         &recv_buf[..size],
                                         peer,
                                         &context,
                                         &mut fallback_mgr,
                                     )
-                                    .await?;
+                                    .await
+                                    {
+                                        warn!("Failed to handle packet from {peer}: {e}; stopping burst");
+                                        break;
+                                    }
                                 }
                                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
                                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -340,14 +348,15 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
                                     if is_transient_udp_error(&err) {
                                         break;
                                     }
-                                    return Err(map_io(err));
+                                    warn!("Non-transient UDP recv error: {err}; continuing");
+                                    break;
                                 }
                             }
                         }
                     }
                     Err(err) => {
                         if !is_transient_udp_error(&err) {
-                            return Err(map_io(err));
+                            warn!("Non-transient UDP recv_from error: {err}; continuing");
                         }
                     }
                 }
@@ -399,7 +408,8 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
                     )
                 };
                 if ret < 0 {
-                    return Err(ServerError::new("Failed to prepare QUIC packet"));
+                    warn!("Failed to prepare QUIC packet (ret={ret}); skipping slot");
+                    continue;
                 }
 
                 if send_length == 0 {
@@ -454,15 +464,20 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
             } else {
                 (None, slot.rcode)
             };
-            let response = encode_response(&ResponseParams {
+            let response = match encode_response(&ResponseParams {
                 id: slot.id,
                 rd: slot.rd,
                 cd: slot.cd,
                 question: &slot.question,
                 payload,
                 rcode,
-            })
-            .map_err(|err| ServerError::new(err.to_string()))?;
+            }) {
+                Ok(r) => r,
+                Err(err) => {
+                    warn!("Failed to encode DNS response: {err}; skipping slot");
+                    continue;
+                }
+            };
             let peer = if map_ipv4_peers {
                 normalize_dual_stack_addr(slot.peer)
             } else {
@@ -470,7 +485,7 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
             };
             if let Err(err) = udp.send_to(&response, peer).await {
                 if !is_transient_udp_error(&err) {
-                    return Err(map_io(err));
+                    warn!("Non-transient UDP send error to {peer}: {err}; continuing");
                 }
             }
         }

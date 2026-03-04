@@ -6,7 +6,9 @@ use slipstream_ffi::picoquic::{
 };
 use slipstream_ffi::{socket_addr_to_storage, ResolverMode};
 use std::net::SocketAddr;
+use tracing::warn;
 
+use super::balancer::DomainBalancer;
 use super::resolver::ResolverState;
 use slipstream_core::normalize_dual_stack_addr;
 
@@ -16,6 +18,7 @@ pub(crate) struct DnsResponseContext<'a> {
     pub(crate) quic: *mut picoquic_quic_t,
     pub(crate) local_addr_storage: &'a libc::sockaddr_storage,
     pub(crate) resolvers: &'a mut [ResolverState],
+    pub(crate) balancer: &'a mut DomainBalancer,
 }
 
 pub(crate) fn handle_dns_response(
@@ -58,8 +61,14 @@ pub(crate) fn handle_dns_response(
             )
         };
         if ret < 0 {
-            return Err(ClientError::new("Failed processing inbound QUIC packet"));
+            warn!("Failed processing inbound QUIC packet (ret={ret}); skipping");
+            return Ok(());
         }
+        let resolved_idx = resolver_index.or_else(|| {
+            ctx.resolvers
+                .iter()
+                .position(|r| r.added && r.path_id == first_path)
+        });
         let resolver = if let Some(resolver) = find_resolver_by_path_id(ctx.resolvers, first_path) {
             Some(resolver)
         } else {
@@ -81,11 +90,32 @@ pub(crate) fn handle_dns_response(
                     resolver.pending_polls.saturating_add(1).min(MAX_POLL_BURST);
             }
         }
+        // Record health: successful response for all domains of this resolver.
+        // The DNS layer doesn't know which domain was used in the query, so we
+        // credit the resolver broadly — the balancer weights will still steer
+        // toward low-latency domains via other signals.
+        if let Some(ri) = resolved_idx {
+            let num_domains = ctx.balancer.num_domains();
+            for d in 0..num_domains {
+                ctx.balancer.record_success(ri, d, None, payload.len());
+            }
+        }
     } else if let Some(response_id) = response_id {
+        let resolver_index = ctx
+            .resolvers
+            .iter()
+            .position(|resolver| resolver.addr == peer);
         if let Some(resolver) = find_resolver_by_addr(ctx.resolvers, peer) {
             resolver.debug.dns_responses = resolver.debug.dns_responses.saturating_add(1);
             if resolver.mode == ResolverMode::Authoritative {
                 resolver.inflight_poll_ids.remove(&response_id);
+            }
+        }
+        // Empty response (no payload) — record failure for balancer health.
+        if let Some(ri) = resolver_index {
+            let num_domains = ctx.balancer.num_domains();
+            for d in 0..num_domains {
+                ctx.balancer.record_failure(ri, d);
             }
         }
     }

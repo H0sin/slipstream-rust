@@ -26,20 +26,31 @@ use runtime::run_client;
     )
 )]
 struct Args {
+    /// Local TCP listen address [default: ::]
     #[arg(long = "tcp-listen-host", default_value = "::")]
     tcp_listen_host: String,
+
+    /// Local TCP listen port [default: 5201]
     #[arg(long = "tcp-listen-port", short = 'l', default_value_t = 5201)]
     tcp_listen_port: u16,
+
+    /// Recursive DNS resolver (IP:PORT). May be repeated for multi-resolver balancing
     #[arg(long = "resolver", short = 'r', value_parser = parse_resolver)]
     resolver: Vec<HostPort>,
+
+    /// QUIC congestion control algorithm
     #[arg(
         long = "congestion-control",
         short = 'c',
         value_parser = ["bbr", "dcubic"]
     )]
     congestion_control: Option<String>,
+
+    /// Authoritative DNS resolver (IP:PORT). May be repeated
     #[arg(long = "authoritative", value_parser = parse_resolver)]
     authoritative: Vec<HostPort>,
+
+    /// Enable Generic Segmentation Offload (Linux only)
     #[arg(
         short = 'g',
         long = "gso",
@@ -48,16 +59,32 @@ struct Args {
         default_missing_value = "true"
     )]
     gso: bool,
+
+    /// Tunnel domain(s). May be repeated for multi-domain load balancing
     #[arg(long = "domain", short = 'd', value_parser = parse_domain)]
-    domain: Option<String>,
+    domains: Vec<String>,
+
+    /// Path to server TLS certificate for pinning (DER or PEM)
     #[arg(long = "cert", value_name = "PATH")]
     cert: Option<String>,
+
+    /// QUIC keep-alive interval in milliseconds [default: 400]
     #[arg(long = "keep-alive-interval", short = 't', default_value_t = 400)]
     keep_alive_interval: u16,
+
+    /// Log raw DNS poll packets
     #[arg(long = "debug-poll")]
     debug_poll: bool,
+
+    /// Log stream-level events
     #[arg(long = "debug-streams")]
     debug_streams: bool,
+
+    /// Optional file of IPs/CIDRs for background DNS resolver scanning.
+    /// If omitted the built-in list (public DNS + IR ranges) is used.
+    /// Format: one IP, IP:port, or CIDR per line; '#' comments allowed.
+    #[arg(long = "scan-file", value_name = "PATH")]
+    scan_file: Option<String>,
 }
 
 fn main() {
@@ -85,18 +112,18 @@ fn main() {
         2,
     );
 
-    let domain = if let Some(domain) = args.domain.clone() {
-        domain
+    let domains = if !args.domains.is_empty() {
+        args.domains.clone()
     } else {
-        let option_domain = unwrap_or_exit(
-            parse_domain_option(&sip003_env.plugin_options),
+        let option_domains = unwrap_or_exit(
+            parse_domains_from_options(&sip003_env.plugin_options),
             "SIP003 env error",
             2,
         );
-        if let Some(domain) = option_domain {
-            domain
+        if !option_domains.is_empty() {
+            option_domains
         } else {
-            exit_with_message("A domain is required", 2);
+            exit_with_message("At least one domain is required", 2);
         }
     };
 
@@ -177,11 +204,12 @@ fn main() {
         resolvers: &resolvers,
         congestion_control: congestion_control.as_deref(),
         gso: args.gso,
-        domain: &domain,
+        domains: &domains,
         cert: cert.as_deref(),
         keep_alive_interval: keep_alive_interval as usize,
         debug_poll: args.debug_poll,
         debug_streams: args.debug_streams,
+        scan_file: args.scan_file.as_deref(),
     };
 
     let runtime = Builder::new_current_thread()
@@ -256,27 +284,23 @@ fn has_cli_resolvers(matches: &clap::ArgMatches) -> bool {
             .unwrap_or(false)
 }
 
-fn parse_domain_option(options: &[sip003::Sip003Option]) -> Result<Option<String>, String> {
-    let mut domain = None;
-    let mut saw_domain = false;
+fn parse_domains_from_options(options: &[sip003::Sip003Option]) -> Result<Vec<String>, String> {
+    let mut domains = None;
     for option in options {
         if option.key == "domain" {
-            if saw_domain {
+            if domains.is_some() {
                 return Err("SIP003 domain option must not be repeated".to_string());
             }
-            saw_domain = true;
-            let mut entries = sip003::split_list(&option.value).map_err(|err| err.to_string())?;
-            if entries.len() > 1 {
-                return Err("SIP003 domain option must contain a single value".to_string());
+            let entries = sip003::split_list(&option.value).map_err(|err| err.to_string())?;
+            let mut parsed = Vec::new();
+            for entry in entries {
+                let normalized = normalize_domain(&entry).map_err(|err| err.to_string())?;
+                parsed.push(normalized);
             }
-            let entry = entries
-                .pop()
-                .ok_or_else(|| "SIP003 domain option must contain a single value".to_string())?;
-            let normalized = normalize_domain(&entry).map_err(|err| err.to_string())?;
-            domain = Some(normalized);
+            domains = Some(parsed);
         }
     }
-    Ok(domain)
+    Ok(domains.unwrap_or_default())
 }
 
 struct ResolverOptions {
@@ -429,10 +453,9 @@ mod tests {
             key: "domain".to_string(),
             value: "example.com".to_string(),
         }];
-        let domain = parse_domain_option(&options)
-            .expect("options should parse")
-            .expect("domain should exist");
-        assert_eq!(domain, "example.com");
+        let domains = parse_domains_from_options(&options).expect("options should parse");
+        assert_eq!(domains.len(), 1);
+        assert_eq!(domains[0], "example.com");
     }
 
     #[test]
@@ -447,16 +470,19 @@ mod tests {
                 value: "example.net".to_string(),
             },
         ];
-        assert!(parse_domain_option(&options).is_err());
+        assert!(parse_domains_from_options(&options).is_err());
     }
 
     #[test]
-    fn plugin_domain_rejects_multiple_entries() {
+    fn plugin_domain_accepts_multiple_entries() {
         let options = vec![sip003::Sip003Option {
             key: "domain".to_string(),
             value: "example.com,example.net".to_string(),
         }];
-        assert!(parse_domain_option(&options).is_err());
+        let domains = parse_domains_from_options(&options).expect("options should parse");
+        assert_eq!(domains.len(), 2);
+        assert_eq!(domains[0], "example.com");
+        assert_eq!(domains[1], "example.net");
     }
 
     #[test]

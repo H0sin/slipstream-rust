@@ -27,13 +27,15 @@ pub struct ClientConfig<'a> {
     pub tcp_listen_host: &'a str,
     pub tcp_listen_port: u16,
     pub resolvers: &'a [ResolverSpec],
-    pub domain: &'a str,
+    pub domains: &'a [String],
     pub cert: Option<&'a str>,
     pub congestion_control: Option<&'a str>,
     pub gso: bool,
     pub keep_alive_interval: usize,
     pub debug_poll: bool,
     pub debug_streams: bool,
+    /// Optional path to a file of IPs/CIDRs for background DNS scanning.
+    pub scan_file: Option<&'a str>,
 }
 
 pub use runtime::{

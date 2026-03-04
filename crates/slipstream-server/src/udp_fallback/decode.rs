@@ -6,6 +6,7 @@ use slipstream_ffi::picoquic::{
 };
 use slipstream_ffi::take_stateless_packet_for_cid;
 use std::net::SocketAddr;
+use tracing::warn;
 
 enum DecodeSlotOutcome {
     Slot(Slot),
@@ -85,7 +86,8 @@ fn decode_slot(
                 )
             };
             if ret < 0 {
-                return Err(ServerError::new("Failed to process QUIC packet"));
+                warn!("Failed to process inbound QUIC packet (ret={ret}); skipping");
+                return Ok(DecodeSlotOutcome::DnsOnly);
             }
             if first_cnx.is_null() {
                 if let Some(payload) =
