@@ -45,6 +45,15 @@ build_resolver_args() {
   done
 }
 
+# Build repeated --authoritative flags from comma-separated string.
+build_authoritative_args() {
+  local IFS=','
+  for a in $1; do
+    a="$(echo "$a" | xargs)"
+    [[ -n "$a" ]] && printf -- '--authoritative %s ' "$a"
+  done
+}
+
 # ═════════════════════════════════════════════════════════════════════
 #  Management mode  (slipstream-cli status|start|stop|restart|logs|edit|uninstall)
 # ═════════════════════════════════════════════════════════════════════
@@ -77,12 +86,20 @@ if [[ "${1:-}" != "" ]]; then
       # Back-compat: old config may have DOMAIN/RESOLVER instead of DOMAINS/RESOLVERS
       DOMAINS="${DOMAINS:-${DOMAIN:-}}"
       RESOLVERS="${RESOLVERS:-${RESOLVER:-}}"
+      AUTHORITATIVES="${AUTHORITATIVES:-}"
+      CONGESTION_CONTROL="${CONGESTION_CONTROL:-}"
+      KEEP_ALIVE_INTERVAL="${KEEP_ALIVE_INTERVAL:-400}"
+      GSO="${GSO:-}"
       echo ""
       echo -e "${CYAN}Current configuration:${NC}"
-      echo -e "  1) Domains:      $DOMAINS"
-      echo -e "  2) Resolvers:    $RESOLVERS"
-      echo -e "  3) Listen port:  $LISTEN_PORT"
-      echo -e "  4) Listen host:  $LISTEN_HOST"
+      echo -e "  1) Domains:            $DOMAINS"
+      echo -e "  2) Resolvers:          ${RESOLVERS:-(none)}"
+      echo -e "  3) Authoritatives:     ${AUTHORITATIVES:-(none)}"
+      echo -e "  4) Listen port:        $LISTEN_PORT"
+      echo -e "  5) Listen host:        $LISTEN_HOST"
+      echo -e "  6) Congestion control: ${CONGESTION_CONTROL:-(default)}"
+      echo -e "  7) Keep-alive (ms):    $KEEP_ALIVE_INTERVAL"
+      echo -e "  8) GSO:                ${GSO:-off}"
       echo ""
       ask "Enter field numbers to edit (e.g. 1 2) or 'all', empty to cancel"
       read -r EDIT_CHOICE < /dev/tty
@@ -92,24 +109,64 @@ if [[ "${1:-}" != "" ]]; then
         read -r NEW_VAL < /dev/tty; [[ -n "$NEW_VAL" ]] && DOMAINS="$NEW_VAL"
       fi
       if [[ "$EDIT_CHOICE" == *"2"* ]] || [[ "$EDIT_CHOICE" == "all" ]]; then
-        ask "Resolvers — comma-separated IP:PORT (e.g. 1.2.3.4:53,5.6.7.8:53) [$RESOLVERS]"
-        read -r NEW_VAL < /dev/tty; [[ -n "$NEW_VAL" ]] && RESOLVERS="$NEW_VAL"
+        ask "Resolvers (recursive) — comma-separated IP:PORT, enter '-' to clear [${RESOLVERS:-(none)}]"
+        read -r NEW_VAL < /dev/tty
+        if [[ "$NEW_VAL" == "-" ]]; then RESOLVERS=""
+        elif [[ -n "$NEW_VAL" ]]; then RESOLVERS="$NEW_VAL"
+        fi
       fi
       if [[ "$EDIT_CHOICE" == *"3"* ]] || [[ "$EDIT_CHOICE" == "all" ]]; then
+        ask "Authoritatives — comma-separated IP:PORT, enter '-' to clear [${AUTHORITATIVES:-(none)}]"
+        read -r NEW_VAL < /dev/tty
+        if [[ "$NEW_VAL" == "-" ]]; then AUTHORITATIVES=""
+        elif [[ -n "$NEW_VAL" ]]; then AUTHORITATIVES="$NEW_VAL"
+        fi
+      fi
+      if [[ "$EDIT_CHOICE" == *"4"* ]] || [[ "$EDIT_CHOICE" == "all" ]]; then
         ask "Listen port [$LISTEN_PORT]"
         read -r NEW_VAL < /dev/tty; [[ -n "$NEW_VAL" ]] && LISTEN_PORT="$NEW_VAL"
       fi
-      if [[ "$EDIT_CHOICE" == *"4"* ]] || [[ "$EDIT_CHOICE" == "all" ]]; then
+      if [[ "$EDIT_CHOICE" == *"5"* ]] || [[ "$EDIT_CHOICE" == "all" ]]; then
         ask "Listen host [$LISTEN_HOST]"
         read -r NEW_VAL < /dev/tty; [[ -n "$NEW_VAL" ]] && LISTEN_HOST="$NEW_VAL"
       fi
+      if [[ "$EDIT_CHOICE" == *"6"* ]] || [[ "$EDIT_CHOICE" == "all" ]]; then
+        ask "Congestion control (bbr/dcubic), enter '-' to use default [${CONGESTION_CONTROL:-(default)}]"
+        read -r NEW_VAL < /dev/tty
+        if [[ "$NEW_VAL" == "-" ]]; then CONGESTION_CONTROL=""
+        elif [[ -n "$NEW_VAL" ]]; then CONGESTION_CONTROL="$NEW_VAL"
+        fi
+      fi
+      if [[ "$EDIT_CHOICE" == *"7"* ]] || [[ "$EDIT_CHOICE" == "all" ]]; then
+        ask "Keep-alive interval in ms [$KEEP_ALIVE_INTERVAL]"
+        read -r NEW_VAL < /dev/tty; [[ -n "$NEW_VAL" ]] && KEEP_ALIVE_INTERVAL="$NEW_VAL"
+      fi
+      if [[ "$EDIT_CHOICE" == *"8"* ]] || [[ "$EDIT_CHOICE" == "all" ]]; then
+        ask "Enable GSO? (on/off) [${GSO:-off}]"
+        read -r NEW_VAL < /dev/tty; [[ -n "$NEW_VAL" ]] && GSO="$NEW_VAL"
+      fi
+      if [[ -z "$RESOLVERS" ]] && [[ -z "$AUTHORITATIVES" ]]; then
+        err "At least one resolver or authoritative address is required."
+        exit 1
+      fi
       DOMAIN_ARGS=$(build_domain_args "$DOMAINS")
-      RESOLVER_ARGS=$(build_resolver_args "$RESOLVERS")
+      RESOLVER_ARGS=""
+      [[ -n "$RESOLVERS" ]] && RESOLVER_ARGS=$(build_resolver_args "$RESOLVERS")
+      AUTH_ARGS=""
+      [[ -n "$AUTHORITATIVES" ]] && AUTH_ARGS=$(build_authoritative_args "$AUTHORITATIVES")
+      EXTRA_ARGS=""
+      [[ -n "$CONGESTION_CONTROL" ]] && EXTRA_ARGS="$EXTRA_ARGS --congestion-control $CONGESTION_CONTROL"
+      [[ -n "$KEEP_ALIVE_INTERVAL" && "$KEEP_ALIVE_INTERVAL" != "400" ]] && EXTRA_ARGS="$EXTRA_ARGS --keep-alive-interval $KEEP_ALIVE_INTERVAL"
+      [[ "$GSO" == "on" ]] && EXTRA_ARGS="$EXTRA_ARGS --gso"
       cat > "$CONF_FILE" <<EOFCONF
 DOMAINS=$DOMAINS
 RESOLVERS=$RESOLVERS
+AUTHORITATIVES=$AUTHORITATIVES
 LISTEN_PORT=$LISTEN_PORT
 LISTEN_HOST=$LISTEN_HOST
+CONGESTION_CONTROL=$CONGESTION_CONTROL
+KEEP_ALIVE_INTERVAL=$KEEP_ALIVE_INTERVAL
+GSO=$GSO
 DOWNLOAD_BASE=${DOWNLOAD_BASE:-}
 EOFCONF
       cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOFSVC
@@ -119,7 +176,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=$BIN_DIR/slipstream-client --tcp-listen-host $LISTEN_HOST --tcp-listen-port $LISTEN_PORT $RESOLVER_ARGS $DOMAIN_ARGS
+ExecStart=$BIN_DIR/slipstream-client --tcp-listen-host $LISTEN_HOST --tcp-listen-port $LISTEN_PORT $RESOLVER_ARGS $AUTH_ARGS $DOMAIN_ARGS$EXTRA_ARGS
 Restart=always
 RestartSec=3
 LimitNOFILE=65535
@@ -191,9 +248,17 @@ if [[ -f "$BIN_DIR/slipstream-client" ]] && [[ -f "/etc/systemd/system/${SERVICE
     source "$CONF_FILE"
     DOMAINS="${DOMAINS:-${DOMAIN:-}}"
     RESOLVERS="${RESOLVERS:-${RESOLVER:-}}"
-    echo -e "  Domains:   ${GREEN}$DOMAINS${NC}"
-    echo -e "  Resolvers: $RESOLVERS"
-    echo -e "  Listen:    $LISTEN_HOST:$LISTEN_PORT"
+    AUTHORITATIVES="${AUTHORITATIVES:-}"
+    CONGESTION_CONTROL="${CONGESTION_CONTROL:-}"
+    KEEP_ALIVE_INTERVAL="${KEEP_ALIVE_INTERVAL:-400}"
+    GSO="${GSO:-}"
+    echo -e "  Domains:         ${GREEN}$DOMAINS${NC}"
+    echo -e "  Resolvers:       ${RESOLVERS:-(none)}"
+    echo -e "  Authoritatives:  ${AUTHORITATIVES:-(none)}"
+    echo -e "  Listen:          $LISTEN_HOST:$LISTEN_PORT"
+    echo -e "  CC:              ${CONGESTION_CONTROL:-(default)}"
+    echo -e "  Keep-alive:      ${KEEP_ALIVE_INTERVAL}ms"
+    echo -e "  GSO:             ${GSO:-off}"
     echo ""
   fi
   echo -e "  ${YELLOW}Commands:${NC}"
@@ -237,9 +302,16 @@ ask "Tunnel domains — comma-separated (e.g. t.example.com or t1.ex.com,t2.ex.c
 read -r DOMAINS < /dev/tty
 [[ -z "$DOMAINS" ]] && { err "At least one domain is required."; exit 1; }
 
-ask "Resolver addresses — comma-separated IP:PORT (e.g. 1.2.3.4:53 or 1.2.3.4:53,5.6.7.8:53)"
+ask "Recursive resolver addresses — comma-separated IP:PORT (e.g. 8.8.8.8:53) or leave empty"
 read -r RESOLVERS < /dev/tty
-[[ -z "$RESOLVERS" ]] && { err "At least one resolver is required."; exit 1; }
+
+ask "Authoritative resolver addresses — comma-separated IP:PORT (e.g. 89.167.94.217:53) or leave empty"
+read -r AUTHORITATIVES < /dev/tty
+
+if [[ -z "$RESOLVERS" ]] && [[ -z "$AUTHORITATIVES" ]]; then
+  err "At least one resolver or authoritative address is required."
+  exit 1
+fi
 
 ask "Local TCP listen port [default: 1080]"
 read -r LISTEN_PORT < /dev/tty
@@ -249,15 +321,37 @@ ask "Local TCP listen host [default: 0.0.0.0]"
 read -r LISTEN_HOST < /dev/tty
 LISTEN_HOST="${LISTEN_HOST:-0.0.0.0}"
 
+ask "Congestion control algorithm (bbr/dcubic) or leave empty for default"
+read -r CONGESTION_CONTROL < /dev/tty
+
+ask "Keep-alive interval in ms [default: 400]"
+read -r KEEP_ALIVE_INTERVAL < /dev/tty
+KEEP_ALIVE_INTERVAL="${KEEP_ALIVE_INTERVAL:-400}"
+
+ask "Enable GSO? (on/off) [default: off]"
+read -r GSO < /dev/tty
+GSO="${GSO:-off}"
+
 DOMAIN_ARGS=$(build_domain_args "$DOMAINS")
-RESOLVER_ARGS=$(build_resolver_args "$RESOLVERS")
+RESOLVER_ARGS=""
+[[ -n "$RESOLVERS" ]] && RESOLVER_ARGS=$(build_resolver_args "$RESOLVERS")
+AUTH_ARGS=""
+[[ -n "$AUTHORITATIVES" ]] && AUTH_ARGS=$(build_authoritative_args "$AUTHORITATIVES")
+EXTRA_ARGS=""
+[[ -n "$CONGESTION_CONTROL" ]] && EXTRA_ARGS="$EXTRA_ARGS --congestion-control $CONGESTION_CONTROL"
+[[ -n "$KEEP_ALIVE_INTERVAL" && "$KEEP_ALIVE_INTERVAL" != "400" ]] && EXTRA_ARGS="$EXTRA_ARGS --keep-alive-interval $KEEP_ALIVE_INTERVAL"
+[[ "$GSO" == "on" ]] && EXTRA_ARGS="$EXTRA_ARGS --gso"
 
 # Save config.
 cat > "$CONF_FILE" <<EOF
 DOMAINS=$DOMAINS
 RESOLVERS=$RESOLVERS
+AUTHORITATIVES=$AUTHORITATIVES
 LISTEN_PORT=$LISTEN_PORT
 LISTEN_HOST=$LISTEN_HOST
+CONGESTION_CONTROL=$CONGESTION_CONTROL
+KEEP_ALIVE_INTERVAL=$KEEP_ALIVE_INTERVAL
+GSO=$GSO
 DOWNLOAD_BASE=$DOWNLOAD_BASE
 EOF
 
@@ -269,7 +363,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=$BIN_DIR/slipstream-client --tcp-listen-host $LISTEN_HOST --tcp-listen-port $LISTEN_PORT $RESOLVER_ARGS $DOMAIN_ARGS
+ExecStart=$BIN_DIR/slipstream-client --tcp-listen-host $LISTEN_HOST --tcp-listen-port $LISTEN_PORT $RESOLVER_ARGS $AUTH_ARGS $DOMAIN_ARGS$EXTRA_ARGS
 Restart=always
 RestartSec=3
 LimitNOFILE=65535
@@ -298,9 +392,13 @@ echo -e "${CYAN}═════════════════════�
 echo -e "${GREEN}  Done!${NC}"
 echo -e "${CYAN}═══════════════════════════════════════════════════════${NC}"
 echo ""
-echo -e "  Domains:    $DOMAINS"
-echo -e "  Resolvers:  $RESOLVERS"
-echo -e "  Listen:     $LISTEN_HOST:$LISTEN_PORT"
+echo -e "  Domains:         $DOMAINS"
+echo -e "  Resolvers:       ${RESOLVERS:-(none)}"
+echo -e "  Authoritatives:  ${AUTHORITATIVES:-(none)}"
+echo -e "  Listen:          $LISTEN_HOST:$LISTEN_PORT"
+echo -e "  CC:              ${CONGESTION_CONTROL:-(default)}"
+echo -e "  Keep-alive:      ${KEEP_ALIVE_INTERVAL}ms"
+echo -e "  GSO:             ${GSO:-off}"
 echo ""
 echo -e "  ${YELLOW}Management:${NC}"
 echo -e "  slipstream-cli status"

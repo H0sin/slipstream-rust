@@ -366,6 +366,9 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
 
             // ── Per-tunnel: drain stream I/O commands ────────────────
             for tunnel in pool.tunnels.iter_mut() {
+                if tunnel.is_closing() {
+                    continue;
+                }
                 drain_commands(tunnel.cnx, tunnel.state_ptr, &mut tunnel.command_rx);
                 drain_stream_data(tunnel.cnx, tunnel.state_ptr);
             }
@@ -554,6 +557,9 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
 
             // ── Post-select: drain all tunnels ───────────────────────
             for tunnel in pool.tunnels.iter_mut() {
+                if tunnel.is_closing() {
+                    continue;
+                }
                 drain_commands(tunnel.cnx, tunnel.state_ptr, &mut tunnel.command_rx);
                 drain_stream_data(tunnel.cnx, tunnel.state_ptr);
                 drain_path_events(
@@ -848,7 +854,11 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
         // ── Cleanup: close all tunnel connections ────────────────────
         for tunnel in pool.tunnels.iter_mut() {
             unsafe {
-                picoquic_close(tunnel.cnx, 0);
+                // Only close tunnels that are not already disconnected;
+                // calling picoquic_close on a disconnected cnx is UB.
+                if !(*tunnel.state_ptr).is_closing() {
+                    picoquic_close(tunnel.cnx, 0);
+                }
                 (*tunnel.state_ptr).reset_for_reconnect();
             }
         }
