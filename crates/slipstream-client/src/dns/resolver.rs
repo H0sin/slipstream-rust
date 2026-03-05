@@ -92,32 +92,6 @@ pub(crate) fn reset_resolver_path(resolver: &mut ResolverState) {
     resolver.next_probe_at = 0;
 }
 
-/// Create a new secondary `ResolverState` for a dynamically discovered resolver.
-/// Always starts as un-added Recursive mode; `add_paths` will probe it.
-pub(crate) fn new_discovered_resolver(
-    addr: std::net::SocketAddr,
-    mtu: u32,
-    debug_poll: bool,
-) -> ResolverState {
-    let addr = normalize_dual_stack_addr(addr);
-    ResolverState {
-        addr,
-        storage: socket_addr_to_storage(addr),
-        local_addr_storage: None,
-        mode: ResolverMode::Recursive,
-        added: false,
-        path_id: -1,
-        unique_path_id: None,
-        probe_attempts: 0,
-        next_probe_at: 0,
-        pending_polls: 0,
-        inflight_poll_ids: HashMap::new(),
-        pacing_budget: None, // Recursive — no pacing budget
-        last_pacing_snapshot: None,
-        debug: DebugMetrics::new(debug_poll),
-    }
-}
-
 pub(crate) fn sockaddr_storage_to_socket_addr(
     storage: &libc::sockaddr_storage,
 ) -> Result<SocketAddr, ClientError> {

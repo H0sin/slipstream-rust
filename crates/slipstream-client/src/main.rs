@@ -4,6 +4,7 @@ mod pacing;
 mod pinning;
 mod runtime;
 mod streams;
+mod tunnel;
 
 use clap::{parser::ValueSource, ArgGroup, CommandFactory, FromArgMatches, Parser};
 use slipstream_core::{
@@ -80,11 +81,6 @@ struct Args {
     #[arg(long = "debug-streams")]
     debug_streams: bool,
 
-    /// Optional file of IPs/CIDRs for background DNS resolver scanning.
-    /// If omitted the built-in list (public DNS + IR ranges) is used.
-    /// Format: one IP, IP:port, or CIDR per line; '#' comments allowed.
-    #[arg(long = "scan-file", value_name = "PATH")]
-    scan_file: Option<String>,
 }
 
 fn main() {
@@ -209,7 +205,6 @@ fn main() {
         keep_alive_interval: keep_alive_interval as usize,
         debug_poll: args.debug_poll,
         debug_streams: args.debug_streams,
-        scan_file: args.scan_file.as_deref(),
     };
 
     let runtime = Builder::new_current_thread()

@@ -38,6 +38,7 @@ pub(crate) async fn send_poll_queries(
     udp: &TokioUdpSocket,
     balancer: &mut DomainBalancer,
     resolver_idx: usize,
+    fixed_domain_idx: Option<usize>,
     local_addr_storage: &mut libc::sockaddr_storage,
     dns_id: &mut u16,
     resolver: &mut ResolverState,
@@ -91,7 +92,8 @@ pub(crate) async fn send_poll_queries(
         resolver.debug.polls_sent = resolver.debug.polls_sent.saturating_add(1);
 
         let poll_id = *dns_id;
-        let domain_idx = balancer.select_domain_for_resolver(resolver_idx).unwrap_or(0);
+        let domain_idx = fixed_domain_idx
+            .unwrap_or_else(|| balancer.select_domain_for_resolver(resolver_idx).unwrap_or(0));
         let selected_domain = balancer.domain(domain_idx);
         let qname = match build_qname(&send_buf[..send_length], selected_domain) {
             Ok(q) => q,

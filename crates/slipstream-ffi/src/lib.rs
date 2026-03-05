@@ -34,8 +34,6 @@ pub struct ClientConfig<'a> {
     pub keep_alive_interval: usize,
     pub debug_poll: bool,
     pub debug_streams: bool,
-    /// Optional path to a file of IPs/CIDRs for background DNS scanning.
-    pub scan_file: Option<&'a str>,
 }
 
 pub use runtime::{

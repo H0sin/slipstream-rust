@@ -3,14 +3,14 @@ pub(crate) mod setup;
 
 use self::path::{
     apply_path_mode, drain_path_events, fetch_path_quality,
-    loop_burst_total, path_poll_burst_max,
+    path_poll_burst_max,
 };
 use self::setup::{bind_tcp_listener, bind_udp_socket, compute_mtu, map_io};
 use crate::dns::{
-    add_paths, expire_inflight_polls, handle_dns_response, maybe_report_debug,
-    new_discovered_resolver, refresh_resolver_path, resolve_resolvers, resolver_mode_to_c,
-    send_poll_queries, sockaddr_storage_to_socket_addr, DiscoveredResolver, DnsResponseContext,
-    DomainBalancer, HealthUpdate, ResolverSnapshot,
+    expire_inflight_polls, handle_dns_response_tunneled, maybe_report_debug,
+    refresh_resolver_path, resolve_resolvers, resolver_mode_to_c,
+    send_poll_queries, sockaddr_storage_to_socket_addr,
+    DomainBalancer, HealthUpdate, TunnelSnapshot, TunneledResponseContext,
 };
 use crate::error::ClientError;
 use crate::pacing::{cwnd_target_polls, inflight_packet_estimate};
@@ -19,6 +19,7 @@ use crate::streams::{
     acceptor::ClientAcceptor, client_callback, drain_commands, drain_stream_data, handle_command,
     ClientState, Command,
 };
+use crate::tunnel::{TunnelPool, TunnelRoute};
 use slipstream_core::{net::is_transient_udp_error, normalize_dual_stack_addr};
 use slipstream_dns::{build_qname, encode_query, QueryParams, CLASS_IN, RR_TXT};
 use slipstream_ffi::{
@@ -41,7 +42,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Notify};
 use tokio::time::sleep;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 // Protocol defaults; see docs/config.md for details.
 const SLIPSTREAM_ALPN: &str = "picoquic_sample";
@@ -80,7 +81,10 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
     let mtu = compute_mtu(max_domain_len)?;
     let udp = bind_udp_socket().await?;
 
-    let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+    // Accept channel: the TCP acceptor pushes new connections here.
+    // Per-tunnel command channels are created inside the reconnect loop.
+    let (accept_tx, mut accept_rx) = mpsc::unbounded_channel::<Command>();
+    // Shared data notify — wakes the main loop when any tunnel has data.
     let data_notify = Arc::new(Notify::new());
     let acceptor = ClientAcceptor::new();
     let debug_streams = config.debug_streams;
@@ -112,7 +116,8 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
             }
         }
     };
-    acceptor.spawn(listener, command_tx.clone());
+    // Acceptor pushes new TCP connections to accept_tx (not per-tunnel).
+    acceptor.spawn(listener, accept_tx.clone());
     info!("Listening on TCP port {} (host {})", tcp_port, bound_host);
 
     let alpn = CString::new(SLIPSTREAM_ALPN)
@@ -126,31 +131,10 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
         None => None,
     };
 
-    let mut state = Box::new(ClientState::new(
-        command_tx,
-        data_notify.clone(),
-        debug_streams,
-        acceptor,
-    ));
-    let state_ptr: *mut ClientState = &mut *state;
-    let _state = state;
-
     let mut reconnect_delay = Duration::from_millis(RECONNECT_SLEEP_MIN_MS);
 
-    // Spawn background DNS scanner.  Uses built-in default ranges when
-    // no --scan-file is specified; merges file + defaults when it is.
-    let (scanner_tx, scanner_rx) = mpsc::unbounded_channel();
-    let mut scanner_rx: Option<mpsc::UnboundedReceiver<DiscoveredResolver>> = Some(scanner_rx);
-    {
-        let scan_file = config.scan_file.map(|s| s.to_string());
-        let domains = config.domains.to_vec();
-        tokio::spawn(async move {
-            crate::dns::scanner::run_scanner(scan_file, domains, scanner_tx).await;
-        });
-    }
-
-    // Spawn background health checker for active resolvers.
-    let (health_snapshot_tx, health_snapshot_rx) = mpsc::unbounded_channel::<Vec<ResolverSnapshot>>();
+    // Spawn background per-tunnel health checker.
+    let (health_snapshot_tx, health_snapshot_rx) = mpsc::unbounded_channel::<Vec<TunnelSnapshot>>();
     let (health_result_tx, mut health_result_rx) = mpsc::unbounded_channel::<HealthUpdate>();
     {
         let domains = config.domains.to_vec();
@@ -159,27 +143,24 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
         });
     }
 
-    // Create balancer ONCE before the reconnect loop so that health
-    // state (suspended resolvers, cooldowns) is preserved across
-    // reconnects.  It will be resized inside the loop if the resolver
-    // list changes.
+    // Validate resolvers once before the reconnect loop.
     let initial_resolvers = resolve_resolvers(config.resolvers, mtu, config.debug_poll)?;
     if initial_resolvers.is_empty() {
         return Err(ClientError::new("At least one resolver is required"));
     }
     let mut balancer = DomainBalancer::new(config.domains, initial_resolvers.len());
-    drop(initial_resolvers); // Only needed for the count; re-resolved inside loop.
+    drop(initial_resolvers);
     info!("Domain balancer created: {}", balancer.summary());
 
     let mut reconnect_count: u64 = 0;
 
     loop {
-        let mut resolvers = resolve_resolvers(config.resolvers, mtu, config.debug_poll)?;
-        if resolvers.is_empty() {
+        let base_resolvers = resolve_resolvers(config.resolvers, mtu, config.debug_poll)?;
+        if base_resolvers.is_empty() {
             return Err(ClientError::new("At least one resolver is required"));
         }
 
-        balancer.resize_resolvers(resolvers.len());
+        balancer.resize_resolvers(base_resolvers.len());
         if reconnect_count > 0 {
             info!(
                 "Reconnect #{}: balancer state preserved — {}",
@@ -192,6 +173,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
         let mut local_addr_storage = socket_addr_to_storage(udp.local_addr().map_err(map_io)?);
 
         let current_time = unsafe { picoquic_current_time() };
+        // Shared QUIC context — one context, one connection per tunnel.
         let quic = unsafe {
             picoquic_create(
                 8,
@@ -200,7 +182,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 std::ptr::null(),
                 alpn.as_ptr(),
                 Some(client_callback),
-                state_ptr as *mut _,
+                std::ptr::null_mut(), // default ctx; overridden per-connection
                 None,
                 std::ptr::null_mut(),
                 std::ptr::null(),
@@ -235,51 +217,125 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 .unwrap_or(std::ptr::null());
             slipstream_set_cc_override(override_ptr);
         }
-        unsafe {
-            slipstream_set_default_path_mode(resolver_mode_to_c(resolvers[0].mode));
-        }
         if let Some(cert) = config.cert {
             configure_pinned_certificate(quic, cert).map_err(ClientError::new)?;
-        }
-        let mut server_storage = resolvers[0].storage;
-        // picoquic_create_client_cnx calls picoquic_start_client_cnx internally (see picoquic/quicctx.c).
-        let cnx = unsafe {
-            picoquic_create_client_cnx(
-                quic,
-                &mut server_storage as *mut _ as *mut libc::sockaddr,
-                current_time,
-                0,
-                sni.as_ptr(),
-                alpn.as_ptr(),
-                Some(client_callback),
-                state_ptr as *mut _,
-            )
-        };
-        if cnx.is_null() {
-            return Err(ClientError::new("Could not create QUIC connection"));
-        }
-
-        apply_path_mode(cnx, &mut resolvers[0])?;
-
-        unsafe {
-            picoquic_set_callback(cnx, Some(client_callback), state_ptr as *mut _);
-            picoquic_enable_path_callbacks(cnx, 1);
-            if config.keep_alive_interval > 0 {
-                picoquic_enable_keep_alive(cnx, config.keep_alive_interval as u64 * 1000);
-            } else {
-                picoquic_disable_keep_alive(cnx);
-            }
         }
 
         if config.gso {
             warn!("GSO is not implemented in the Rust client loop yet.");
         }
 
-        let mut dns_id = 1u16;
+        // ── Create one tunnel per (resolver, domain) pair ───────────
+        let mut pool = TunnelPool::new();
+        // Keep Box<ClientState> alive alongside the pool so pointers
+        // stay valid.  Dropped when we break out of the inner loop.
+        let mut _tunnel_states: Vec<Box<ClientState>> = Vec::new();
+
+        for (ri, base_res) in base_resolvers.iter().enumerate() {
+            for (di, domain) in config.domains.iter().enumerate() {
+                let tunnel_id = pool.tunnels.len();
+                let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Command>();
+                let mut tunnel_state = Box::new(ClientState::new(
+                    cmd_tx,
+                    data_notify.clone(),
+                    debug_streams,
+                    acceptor.clone(),
+                ));
+                let tunnel_state_ptr: *mut ClientState = &mut *tunnel_state;
+
+                unsafe {
+                    slipstream_set_default_path_mode(resolver_mode_to_c(base_res.mode));
+                }
+
+                let mut server_storage = base_res.storage;
+                let cnx = unsafe {
+                    picoquic_create_client_cnx(
+                        quic,
+                        &mut server_storage as *mut _ as *mut libc::sockaddr,
+                        current_time,
+                        0,
+                        sni.as_ptr(),
+                        alpn.as_ptr(),
+                        Some(client_callback),
+                        tunnel_state_ptr as *mut _,
+                    )
+                };
+                if cnx.is_null() {
+                    warn!(
+                        "Could not create QUIC connection for tunnel[{}] (resolver={} domain={}); skipping",
+                        tunnel_id, base_res.addr, domain
+                    );
+                    continue;
+                }
+
+                // Per-tunnel resolver state.
+                let mut resolver = crate::dns::resolver::ResolverState {
+                    addr: base_res.addr,
+                    storage: base_res.storage,
+                    local_addr_storage: None,
+                    mode: base_res.mode,
+                    added: true,
+                    path_id: 0,
+                    unique_path_id: Some(0),
+                    probe_attempts: 0,
+                    next_probe_at: 0,
+                    pending_polls: 0,
+                    inflight_poll_ids: std::collections::HashMap::new(),
+                    pacing_budget: match base_res.mode {
+                        ResolverMode::Authoritative => {
+                            Some(crate::pacing::PacingPollBudget::new(mtu))
+                        }
+                        ResolverMode::Recursive => None,
+                    },
+                    last_pacing_snapshot: None,
+                    debug: crate::dns::debug::DebugMetrics::new(config.debug_poll),
+                };
+
+                apply_path_mode(cnx, &mut resolver)?;
+
+                unsafe {
+                    picoquic_set_callback(cnx, Some(client_callback), tunnel_state_ptr as *mut _);
+                    picoquic_enable_path_callbacks(cnx, 1);
+                    if config.keep_alive_interval > 0 {
+                        picoquic_enable_keep_alive(cnx, config.keep_alive_interval as u64 * 1000);
+                    } else {
+                        picoquic_disable_keep_alive(cnx);
+                    }
+                }
+
+                pool.tunnels.push(TunnelRoute {
+                    id: tunnel_id,
+                    resolver_idx: ri,
+                    domain_idx: di,
+                    domain: domain.clone(),
+                    cnx,
+                    state_ptr: tunnel_state_ptr,
+                    command_rx: cmd_rx,
+                    resolver,
+                    dns_id: 1,
+                    healthy: true,
+                    last_activity_at: current_time,
+                });
+                _tunnel_states.push(tunnel_state);
+            }
+        }
+
+        if pool.tunnels.is_empty() {
+            return Err(ClientError::new(
+                "Could not create any QUIC tunnels; check resolver/domain configuration",
+            ));
+        }
+        info!(
+            "Created {} per-route tunnels: {}",
+            pool.tunnels.len(),
+            pool.summary()
+        );
+
         let mut recv_buf = vec![0u8; 4096];
         let mut send_buf = vec![0u8; PICOQUIC_MAX_PACKET_SIZE];
-        let packet_loop_send_max = loop_burst_total(&resolvers, PICOQUIC_PACKET_LOOP_SEND_MAX);
-        let packet_loop_recv_max = loop_burst_total(&resolvers, PICOQUIC_PACKET_LOOP_RECV_MAX);
+        // Use per-tunnel burst limits; aggregate across all tunnels.
+        let packet_loop_send_max = pool.tunnels.len() * PICOQUIC_PACKET_LOOP_SEND_MAX * 2;
+        let packet_loop_recv_max = pool.tunnels.len() * PICOQUIC_PACKET_LOOP_RECV_MAX * 2;
         let mut zero_send_loops = 0u64;
         let mut zero_send_with_streams = 0u64;
         let mut last_flow_block_log_at = 0u64;
@@ -289,122 +345,128 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
 
         'inner: loop {
             let current_time = unsafe { picoquic_current_time() };
-            drain_commands(cnx, state_ptr, &mut command_rx);
-            drain_stream_data(cnx, state_ptr);
-            let closing = unsafe { (*state_ptr).is_closing() };
-            if closing {
-                break;
-            }
 
-            let ready = unsafe { (*state_ptr).is_ready() };
-            if ready {
-                unsafe {
-                    (*state_ptr).update_acceptor_limit(cnx);
-                }
-                if reconnect_delay != Duration::from_millis(RECONNECT_SLEEP_MIN_MS) {
-                    reconnect_delay = Duration::from_millis(RECONNECT_SLEEP_MIN_MS);
-                }
-                if let Err(e) = add_paths(cnx, &mut resolvers) {
-                    warn!("Failed to add resolver paths: {e}; will reconnect");
-                    break 'inner;
-                }
-                for resolver in resolvers.iter_mut() {
-                    if resolver.added {
-                        if let Err(e) = apply_path_mode(cnx, resolver) {
-                            warn!("Failed to apply path mode: {e}; will reconnect");
-                            break 'inner;
-                        }
+            // ── Dispatch new TCP connections to the best tunnel ──────
+            while let Ok(cmd) = accept_rx.try_recv() {
+                if let Command::NewStream { stream, reservation } = cmd {
+                    if let Some(idx) = pool.select_tunnel() {
+                        let t = &mut pool.tunnels[idx];
+                        handle_command(
+                            t.cnx,
+                            t.state_ptr,
+                            Command::NewStream { stream, reservation },
+                        );
+                    } else {
+                        warn!("No healthy tunnel available; dropping TCP connection");
+                        drop(stream);
                     }
                 }
             }
-            drain_path_events(cnx, &mut resolvers, state_ptr, &mut balancer);
 
-            // Hot-add resolvers discovered by the background scanner.
-            if let Some(rx) = scanner_rx.as_mut() {
-                while let Ok(discovered) = rx.try_recv() {
-                    // Skip duplicates.
-                    if resolvers.iter().any(|r| r.addr == discovered.addr) {
-                        continue;
+            // ── Per-tunnel: drain stream I/O commands ────────────────
+            for tunnel in pool.tunnels.iter_mut() {
+                drain_commands(tunnel.cnx, tunnel.state_ptr, &mut tunnel.command_rx);
+                drain_stream_data(tunnel.cnx, tunnel.state_ptr);
+            }
+
+            // Break if any tunnel is closing (full reconnect).
+            if pool.any_closing() {
+                break 'inner;
+            }
+
+            // ── Per-tunnel readiness updates ─────────────────────────
+            for tunnel in pool.tunnels.iter_mut() {
+                if tunnel.is_ready() {
+                    unsafe { (*tunnel.state_ptr).update_acceptor_limit(tunnel.cnx) };
+                    if reconnect_delay != Duration::from_millis(RECONNECT_SLEEP_MIN_MS) {
+                        reconnect_delay = Duration::from_millis(RECONNECT_SLEEP_MIN_MS);
                     }
-                    info!(
-                        "[scanner] +resolver {} ({}ms) — now {} total",
-                        discovered.addr,
-                        discovered.latency.as_millis(),
-                        resolvers.len() + 1,
-                    );
-                    let new_state = new_discovered_resolver(
-                        discovered.addr,
-                        mtu,
-                        config.debug_poll,
-                    );
-                    resolvers.push(new_state);
-                    balancer.add_resolver();
                 }
             }
 
-            // Periodically push a snapshot of active resolvers to the
-            // health checker so it can probe them in the background.
+            // Per-tunnel path events.
+            for tunnel in pool.tunnels.iter_mut() {
+                drain_path_events(
+                    tunnel.cnx,
+                    std::slice::from_mut(&mut tunnel.resolver),
+                    tunnel.state_ptr,
+                    &mut balancer,
+                );
+            }
+
+            // ── Periodically push per-tunnel snapshot to health checker
             if last_health_snapshot_at.elapsed() >= HEALTH_SNAPSHOT_INTERVAL {
-                let snapshot: Vec<ResolverSnapshot> = resolvers
+                let snapshot: Vec<TunnelSnapshot> = pool
+                    .tunnels
                     .iter()
-                    .enumerate()
-                    .map(|(idx, r)| ResolverSnapshot { idx, addr: r.addr })
+                    .map(|t| TunnelSnapshot {
+                        tunnel_id: t.id,
+                        addr: t.resolver.addr,
+                        domain: t.domain.clone(),
+                    })
                     .collect();
                 let _ = health_snapshot_tx.send(snapshot);
                 last_health_snapshot_at = std::time::Instant::now();
             }
 
-            // Drain health-check results and suspend/unsuspend resolvers.
+            // ── Drain per-tunnel health-check results ────────────────
             while let Ok(update) = health_result_rx.try_recv() {
-                if update.healthy {
-                    balancer.unsuspend_resolver(update.resolver_idx);
-                } else {
-                    balancer.suspend_resolver(update.resolver_idx);
+                if let Some(tunnel) = pool.tunnels.get_mut(update.tunnel_id) {
+                    let was_healthy = tunnel.healthy;
+                    tunnel.healthy = update.healthy;
+                    if update.healthy && !was_healthy {
+                        info!("{}: recovered", tunnel.label());
+                        balancer.unsuspend_resolver(tunnel.resolver_idx);
+                    } else if !update.healthy && was_healthy {
+                        warn!("{}: marked unhealthy", tunnel.label());
+                        balancer.suspend_resolver(tunnel.resolver_idx);
+                    }
                 }
             }
 
-            for resolver in resolvers.iter_mut() {
-                if resolver.mode == ResolverMode::Authoritative {
-                    expire_inflight_polls(&mut resolver.inflight_poll_ids, current_time);
+            // ── Per-tunnel: expire inflight polls ────────────────────
+            for tunnel in pool.tunnels.iter_mut() {
+                if tunnel.resolver.mode == ResolverMode::Authoritative {
+                    expire_inflight_polls(&mut tunnel.resolver.inflight_poll_ids, current_time);
                 }
             }
 
+            // ── Sleep timeout calculation ────────────────────────────
             let delay_us =
                 unsafe { picoquic_get_next_wake_delay(quic, current_time, DNS_WAKE_DELAY_MAX_US) };
             let delay_us = if delay_us < 0 { 0 } else { delay_us as u64 };
-            let streams_len_for_sleep = unsafe { (*state_ptr).streams_len() };
-            let mut has_work = streams_len_for_sleep > 0;
-            for resolver in resolvers.iter_mut() {
-                if !refresh_resolver_path(cnx, resolver) {
+            let mut has_work = pool.total_streams() > 0;
+            for tunnel in pool.tunnels.iter_mut() {
+                if !refresh_resolver_path(tunnel.cnx, &mut tunnel.resolver) {
                     continue;
                 }
-                let pending_for_sleep = match resolver.mode {
+                let pending_for_sleep = match tunnel.resolver.mode {
                     ResolverMode::Authoritative => {
-                        let quality = fetch_path_quality(cnx, resolver);
-                        let snapshot = resolver
+                        let quality = fetch_path_quality(tunnel.cnx, &tunnel.resolver);
+                        let snapshot = tunnel
+                            .resolver
                             .pacing_budget
                             .as_mut()
                             .map(|budget| budget.target_inflight(&quality, delay_us.max(1)));
-                        resolver.last_pacing_snapshot = snapshot;
+                        tunnel.resolver.last_pacing_snapshot = snapshot;
                         let target = snapshot
-                            .map(|snapshot| snapshot.target_inflight)
+                            .map(|s| s.target_inflight)
                             .unwrap_or_else(|| cwnd_target_polls(quality.cwin, mtu));
                         let inflight_packets =
                             inflight_packet_estimate(quality.bytes_in_transit, mtu);
                         target.saturating_sub(inflight_packets)
                     }
-                    ResolverMode::Recursive => resolver.pending_polls,
+                    ResolverMode::Recursive => tunnel.resolver.pending_polls,
                 };
                 if pending_for_sleep > 0 {
                     has_work = true;
                 }
-                if resolver.mode == ResolverMode::Authoritative
-                    && !resolver.inflight_poll_ids.is_empty()
+                if tunnel.resolver.mode == ResolverMode::Authoritative
+                    && !tunnel.resolver.inflight_poll_ids.is_empty()
                 {
                     has_work = true;
                 }
             }
-            // Avoid a tight poll loop when idle, but keep the short slice during active transfers.
             let timeout_us = if has_work {
                 delay_us.clamp(1, DNS_POLL_SLICE_US)
             } else {
@@ -412,35 +474,59 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
             };
             let timeout = Duration::from_micros(timeout_us);
 
+            // ── Async select: recv / accept / data / timeout ─────────
             tokio::select! {
-                command = command_rx.recv() => {
-                    if let Some(command) = command {
-                        handle_command(cnx, state_ptr, command);
+                cmd = accept_rx.recv() => {
+                    if let Some(Command::NewStream { stream, reservation }) = cmd {
+                        if let Some(idx) = pool.select_tunnel() {
+                            let t = &mut pool.tunnels[idx];
+                            handle_command(t.cnx, t.state_ptr, Command::NewStream { stream, reservation });
+                        } else {
+                            warn!("No healthy tunnel; dropping TCP connection");
+                        }
                     }
                 }
                 _ = data_notify.notified() => {}
                 recv = udp.recv_from(&mut recv_buf) => {
                     match recv {
                         Ok((size, peer)) => {
-                            let mut response_ctx = DnsResponseContext {
+                            let mut response_ctx = TunneledResponseContext {
                                 quic,
                                 local_addr_storage: &local_addr_storage,
-                                resolvers: &mut resolvers,
                                 balancer: &mut balancer,
                             };
-                            if let Err(e) = handle_dns_response(&recv_buf[..size], peer, &mut response_ctx) {
-                                warn!("DNS response error: {e}; skipping packet");
-                            } else {
-                                last_activity_at = unsafe { picoquic_current_time() };
+                            match handle_dns_response_tunneled(
+                                &recv_buf[..size],
+                                peer,
+                                &mut response_ctx,
+                                &mut pool.tunnels,
+                            ) {
+                                Ok(Some(ti)) => {
+                                    pool.tunnels[ti].last_activity_at = unsafe { picoquic_current_time() };
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    warn!("DNS response error: {e}; skipping packet");
+                                }
                             }
                             for _ in 1..packet_loop_recv_max {
                                 match udp.try_recv_from(&mut recv_buf) {
                                     Ok((size, peer)) => {
-                                        if let Err(e) = handle_dns_response(&recv_buf[..size], peer, &mut response_ctx) {
-                                            warn!("DNS response error (burst): {e}; stopping burst");
-                                            break;
+                                        match handle_dns_response_tunneled(
+                                            &recv_buf[..size],
+                                            peer,
+                                            &mut response_ctx,
+                                            &mut pool.tunnels,
+                                        ) {
+                                            Ok(Some(ti)) => {
+                                                pool.tunnels[ti].last_activity_at = unsafe { picoquic_current_time() };
+                                            }
+                                            Ok(None) => {}
+                                            Err(e) => {
+                                                warn!("DNS response error (burst): {e}; stopping burst");
+                                                break;
+                                            }
                                         }
-                                        last_activity_at = unsafe { picoquic_current_time() };
                                     }
                                     Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
                                     Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -465,10 +551,21 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 _ = sleep(timeout) => {}
             }
 
-            drain_commands(cnx, state_ptr, &mut command_rx);
-            drain_stream_data(cnx, state_ptr);
-            drain_path_events(cnx, &mut resolvers, state_ptr, &mut balancer);
+            // ── Post-select: drain all tunnels ───────────────────────
+            for tunnel in pool.tunnels.iter_mut() {
+                drain_commands(tunnel.cnx, tunnel.state_ptr, &mut tunnel.command_rx);
+                drain_stream_data(tunnel.cnx, tunnel.state_ptr);
+                drain_path_events(
+                    tunnel.cnx,
+                    std::slice::from_mut(&mut tunnel.resolver),
+                    tunnel.state_ptr,
+                    &mut balancer,
+                );
+            }
 
+            // ── Send phase: prepare packets from shared QUIC context ─
+            // picoquic_prepare_next_packet_ex returns which cnx it
+            // prepared for — we map that to a tunnel for DNS encoding.
             'send: for _ in 0..packet_loop_send_max {
                 let current_time = unsafe { picoquic_current_time() };
                 let mut send_length: libc::size_t = 0;
@@ -502,15 +599,19 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 }
                 if send_length == 0 {
                     zero_send_loops = zero_send_loops.saturating_add(1);
-                    let streams_len = unsafe { (*state_ptr).streams_len() };
-                    if streams_len > 0 {
+                    let total_streams = pool.total_streams();
+                    if total_streams > 0 {
                         zero_send_with_streams = zero_send_with_streams.saturating_add(1);
-                        let flow_blocked = unsafe { slipstream_is_flow_blocked(cnx) } != 0;
-                        if flow_blocked {
-                            for resolver in resolvers.iter_mut() {
-                                if resolver.mode == ResolverMode::Recursive && resolver.added {
-                                    resolver.pending_polls = resolver.pending_polls.max(1);
-                                }
+                        // Nudge pending_polls on blocked recursive tunnels.
+                        for tunnel in pool.tunnels.iter_mut() {
+                            let flow_blocked =
+                                unsafe { slipstream_is_flow_blocked(tunnel.cnx) } != 0;
+                            if flow_blocked
+                                && tunnel.resolver.mode == ResolverMode::Recursive
+                                && tunnel.resolver.added
+                            {
+                                tunnel.resolver.pending_polls =
+                                    tunnel.resolver.pending_polls.max(1);
                             }
                         }
                     }
@@ -520,25 +621,34 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 if addr_to.ss_family == 0 {
                     break;
                 }
-                let resolver_idx_for_domain = if let Ok(dest) = sockaddr_storage_to_socket_addr(&addr_to) {
-                    let dest = normalize_dual_stack_addr(dest);
-                    let idx = resolvers.iter().position(|r| r.addr == dest);
-                    if let Some(idx) = idx {
-                        let resolver = &mut resolvers[idx];
-                        resolver.local_addr_storage = Some(unsafe { std::ptr::read(&addr_from) });
-                        resolver.debug.send_packets = resolver.debug.send_packets.saturating_add(1);
-                        resolver.debug.send_bytes =
-                            resolver.debug.send_bytes.saturating_add(send_length as u64);
-                    }
-                    idx.unwrap_or(0)
+
+                // Map last_cnx → tunnel to determine which domain to use.
+                let tunnel_idx = pool.find_by_cnx(last_cnx);
+                let selected_domain = if let Some(ti) = tunnel_idx {
+                    let tunnel = &mut pool.tunnels[ti];
+                    tunnel.resolver.local_addr_storage =
+                        Some(unsafe { std::ptr::read(&addr_from) });
+                    tunnel.resolver.debug.send_packets =
+                        tunnel.resolver.debug.send_packets.saturating_add(1);
+                    tunnel.resolver.debug.send_bytes = tunnel
+                        .resolver
+                        .debug
+                        .send_bytes
+                        .saturating_add(send_length as u64);
+                    tunnel.domain.as_str()
+                } else {
+                    // Fallback: first domain (should not happen in normal operation).
+                    config.domains.first().map(|d| d.as_str()).unwrap_or("unknown.com")
+                };
+
+                let dns_id_for_pkt = if let Some(ti) = tunnel_idx {
+                    let id = pool.tunnels[ti].dns_id;
+                    pool.tunnels[ti].dns_id = pool.tunnels[ti].dns_id.wrapping_add(1);
+                    id
                 } else {
                     0
                 };
 
-                let domain_idx = balancer
-                    .select_domain_for_resolver(resolver_idx_for_domain)
-                    .unwrap_or(0);
-                let selected_domain = balancer.domain(domain_idx);
                 let qname = match build_qname(&send_buf[..send_length], selected_domain) {
                     Ok(q) => q,
                     Err(err) => {
@@ -547,7 +657,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                     }
                 };
                 let params = QueryParams {
-                    id: dns_id,
+                    id: dns_id_for_pkt,
                     qname: &qname,
                     qtype: RR_TXT,
                     qclass: CLASS_IN,
@@ -556,7 +666,6 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                     qdcount: 1,
                     is_query: true,
                 };
-                dns_id = dns_id.wrapping_add(1);
                 let packet = match encode_query(&params) {
                     Ok(p) => p,
                     Err(err) => {
@@ -578,56 +687,48 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                         warn!("Non-transient UDP send error: {err}; will reconnect");
                         break 'inner;
                     }
-                } else {
-                    last_activity_at = unsafe { picoquic_current_time() };
+                } else if let Some(ti) = tunnel_idx {
+                    pool.tunnels[ti].last_activity_at = unsafe { picoquic_current_time() };
                 }
             }
 
-            let has_ready_stream = unsafe { slipstream_has_ready_stream(cnx) != 0 };
-            let flow_blocked = unsafe { slipstream_is_flow_blocked(cnx) != 0 };
-            let streams_len = unsafe { (*state_ptr).streams_len() };
-            if streams_len > 0 && has_ready_stream && flow_blocked {
-                let now = unsafe { picoquic_current_time() };
-                if now.saturating_sub(last_flow_block_log_at) >= FLOW_BLOCKED_LOG_INTERVAL_US {
-                    let metrics = unsafe { (*state_ptr).stream_debug_metrics() };
-                    let backlog = unsafe { (*state_ptr).stream_backlog_summaries(8) };
-                    let (enqueued_bytes, last_enqueue_at) =
-                        unsafe { (*state_ptr).debug_snapshot() };
-                    let last_enqueue_ms = if last_enqueue_at == 0 {
-                        0
-                    } else {
-                        now.saturating_sub(last_enqueue_at) / 1_000
-                    };
-                    error!(
-                        "connection flow blocked: streams={} streams_with_rx_queued={} queued_bytes_total={} streams_with_recv_fin={} streams_with_send_fin={} streams_discarding={} streams_with_unconsumed_rx={} enqueued_bytes={} last_enqueue_ms={} zero_send_with_streams={} zero_send_loops={} flow_blocked={} has_ready_stream={} backlog={:?}",
-                        streams_len,
-                        metrics.streams_with_rx_queued,
-                        metrics.queued_bytes_total,
-                        metrics.streams_with_recv_fin,
-                        metrics.streams_with_send_fin,
-                        metrics.streams_discarding,
-                        metrics.streams_with_unconsumed_rx,
-                        enqueued_bytes,
-                        last_enqueue_ms,
-                        zero_send_with_streams,
-                        zero_send_loops,
-                        flow_blocked,
-                        has_ready_stream,
-                        backlog
-                    );
-                    last_flow_block_log_at = now;
+            // ── Per-tunnel flow-blocked diagnostics ──────────────────
+            for tunnel in pool.tunnels.iter_mut() {
+                let has_ready_stream =
+                    unsafe { slipstream_has_ready_stream(tunnel.cnx) != 0 };
+                let flow_blocked =
+                    unsafe { slipstream_is_flow_blocked(tunnel.cnx) != 0 };
+                let streams_len = tunnel.streams_len();
+                if streams_len > 0 && has_ready_stream && flow_blocked {
+                    let now = unsafe { picoquic_current_time() };
+                    if now.saturating_sub(last_flow_block_log_at) >= FLOW_BLOCKED_LOG_INTERVAL_US {
+                        error!(
+                            "{}: flow blocked, streams={}",
+                            tunnel.label(),
+                            streams_len,
+                        );
+                        last_flow_block_log_at = now;
+                    }
                 }
             }
-            for resolver_idx in 0..resolvers.len() {
-                if !refresh_resolver_path(cnx, &mut resolvers[resolver_idx]) {
+
+            // ── Per-tunnel poll queries ──────────────────────────────
+            for tunnel_idx in 0..pool.tunnels.len() {
+                let tunnel = &mut pool.tunnels[tunnel_idx];
+                if !refresh_resolver_path(tunnel.cnx, &mut tunnel.resolver) {
                     continue;
                 }
-                match resolvers[resolver_idx].mode {
+                let has_ready_stream =
+                    unsafe { slipstream_has_ready_stream(tunnel.cnx) != 0 };
+                let flow_blocked =
+                    unsafe { slipstream_is_flow_blocked(tunnel.cnx) != 0 };
+
+                match tunnel.resolver.mode {
                     ResolverMode::Authoritative => {
-                        let quality = fetch_path_quality(cnx, &resolvers[resolver_idx]);
-                        let snapshot = resolvers[resolver_idx].last_pacing_snapshot;
+                        let quality = fetch_path_quality(tunnel.cnx, &tunnel.resolver);
+                        let snapshot = tunnel.resolver.last_pacing_snapshot;
                         let pacing_target = snapshot
-                            .map(|snapshot| snapshot.target_inflight)
+                            .map(|s| s.target_inflight)
                             .unwrap_or_else(|| cwnd_target_polls(quality.cwin, mtu));
                         let inflight_packets =
                             inflight_packet_estimate(quality.bytes_in_transit, mtu);
@@ -635,154 +736,143 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                         if has_ready_stream && !flow_blocked {
                             poll_deficit = 0;
                         }
-                        if poll_deficit > 0 && resolvers[resolver_idx].debug.enabled {
-                            debug!(
-                                "cc_state: {} cwnd={} in_transit={} rtt_us={} flow_blocked={} deficit={}",
-                                resolvers[resolver_idx].label(),
-                                quality.cwin,
-                                quality.bytes_in_transit,
-                                quality.rtt,
-                                flow_blocked,
-                                poll_deficit
-                            );
-                        }
                         if poll_deficit > 0 {
-                            let burst_max = path_poll_burst_max(&resolvers[resolver_idx]);
+                            let burst_max = path_poll_burst_max(&tunnel.resolver);
                             let mut to_send = poll_deficit.min(burst_max);
                             if let Err(e) = send_poll_queries(
-                                cnx,
+                                tunnel.cnx,
                                 &udp,
                                 &mut balancer,
-                                resolver_idx,
+                                tunnel.resolver_idx,
+                                Some(tunnel.domain_idx),
                                 &mut local_addr_storage,
-                                &mut dns_id,
-                                &mut resolvers[resolver_idx],
+                                &mut tunnel.dns_id,
+                                &mut tunnel.resolver,
                                 &mut to_send,
                                 &mut send_buf,
                             )
                             .await
                             {
-                                warn!("Poll query failed (authoritative): {e}; will reconnect");
-                                break 'inner;
+                                warn!("{}: poll query failed: {e}; marking unhealthy", tunnel.label());
+                                pool.tunnels[tunnel_idx].healthy = false;
                             }
                         }
                     }
                     ResolverMode::Recursive => {
-                        resolvers[resolver_idx].last_pacing_snapshot = None;
-                        if resolvers[resolver_idx].pending_polls > 0 {
-                            let burst_max = path_poll_burst_max(&resolvers[resolver_idx]);
-                            if resolvers[resolver_idx].pending_polls > burst_max {
-                                let mut to_send = burst_max;
-                                if let Err(e) = send_poll_queries(
-                                    cnx,
-                                    &udp,
-                                    &mut balancer,
-                                    resolver_idx,
-                                    &mut local_addr_storage,
-                                    &mut dns_id,
-                                    &mut resolvers[resolver_idx],
-                                    &mut to_send,
-                                    &mut send_buf,
-                                )
-                                .await
-                                {
-                                    warn!("Poll query failed (recursive burst): {e}; will reconnect");
-                                    break 'inner;
-                                }
-                                resolvers[resolver_idx].pending_polls = resolvers[resolver_idx]
-                                    .pending_polls
-                                    .saturating_sub(burst_max)
-                                    .saturating_add(to_send);
+                        tunnel.resolver.last_pacing_snapshot = None;
+                        if tunnel.resolver.pending_polls > 0 {
+                            let burst_max = path_poll_burst_max(&tunnel.resolver);
+                            let to_send_count = tunnel.resolver.pending_polls.min(burst_max);
+                            let mut to_send = to_send_count;
+                            if let Err(e) = send_poll_queries(
+                                tunnel.cnx,
+                                &udp,
+                                &mut balancer,
+                                tunnel.resolver_idx,
+                                Some(tunnel.domain_idx),
+                                &mut local_addr_storage,
+                                &mut tunnel.dns_id,
+                                &mut tunnel.resolver,
+                                &mut to_send,
+                                &mut send_buf,
+                            )
+                            .await
+                            {
+                                warn!("{}: poll query failed: {e}; marking unhealthy", tunnel.label());
+                                pool.tunnels[tunnel_idx].healthy = false;
                             } else {
-                                let mut pending = resolvers[resolver_idx].pending_polls;
-                                if let Err(e) = send_poll_queries(
-                                    cnx,
-                                    &udp,
-                                    &mut balancer,
-                                    resolver_idx,
-                                    &mut local_addr_storage,
-                                    &mut dns_id,
-                                    &mut resolvers[resolver_idx],
-                                    &mut pending,
-                                    &mut send_buf,
-                                )
-                                .await
-                                {
-                                    warn!("Poll query failed (recursive): {e}; will reconnect");
-                                    break 'inner;
-                                }
-                                resolvers[resolver_idx].pending_polls = pending;
+                                tunnel.resolver.pending_polls = tunnel
+                                    .resolver
+                                    .pending_polls
+                                    .saturating_sub(to_send_count)
+                                    .saturating_add(to_send);
                             }
                         }
                     }
                 }
             }
 
+            // ── Per-tunnel debug reporting ───────────────────────────
             let report_time = unsafe { picoquic_current_time() };
-            let (enqueued_bytes, last_enqueue_at) = unsafe { (*state_ptr).debug_snapshot() };
-            let streams_len = unsafe { (*state_ptr).streams_len() };
-            for resolver in resolvers.iter_mut() {
-                resolver.debug.enqueued_bytes = enqueued_bytes;
-                resolver.debug.last_enqueue_at = last_enqueue_at;
-                resolver.debug.zero_send_loops = zero_send_loops;
-                resolver.debug.zero_send_with_streams = zero_send_with_streams;
-                if !refresh_resolver_path(cnx, resolver) {
+            for tunnel in pool.tunnels.iter_mut() {
+                let (enqueued_bytes, last_enqueue_at) =
+                    unsafe { (*tunnel.state_ptr).debug_snapshot() };
+                let streams_len = tunnel.streams_len();
+                tunnel.resolver.debug.enqueued_bytes = enqueued_bytes;
+                tunnel.resolver.debug.last_enqueue_at = last_enqueue_at;
+                tunnel.resolver.debug.zero_send_loops = zero_send_loops;
+                tunnel.resolver.debug.zero_send_with_streams = zero_send_with_streams;
+                if !refresh_resolver_path(tunnel.cnx, &mut tunnel.resolver) {
                     continue;
                 }
-                let inflight_polls = resolver.inflight_poll_ids.len();
-                let pending_for_debug = match resolver.mode {
+                let inflight_polls = tunnel.resolver.inflight_poll_ids.len();
+                let pending_for_debug = match tunnel.resolver.mode {
                     ResolverMode::Authoritative => {
-                        let quality = fetch_path_quality(cnx, resolver);
+                        let quality = fetch_path_quality(tunnel.cnx, &tunnel.resolver);
                         let inflight_packets =
                             inflight_packet_estimate(quality.bytes_in_transit, mtu);
-                        resolver
+                        tunnel
+                            .resolver
                             .last_pacing_snapshot
-                            .map(|snapshot| {
-                                snapshot.target_inflight.saturating_sub(inflight_packets)
-                            })
+                            .map(|s| s.target_inflight.saturating_sub(inflight_packets))
                             .unwrap_or(0)
                     }
-                    ResolverMode::Recursive => resolver.pending_polls,
+                    ResolverMode::Recursive => tunnel.resolver.pending_polls,
                 };
                 maybe_report_debug(
-                    resolver,
+                    &mut tunnel.resolver,
                     report_time,
                     streams_len,
                     pending_for_debug,
                     inflight_polls,
-                    resolver.last_pacing_snapshot,
+                    tunnel.resolver.last_pacing_snapshot,
                 );
             }
 
-            // Watchdog: force reconnect if no successful send/recv activity.
+            // ── Per-tunnel watchdog ──────────────────────────────────
             let now_wd = unsafe { picoquic_current_time() };
-            if now_wd.saturating_sub(last_activity_at) >= WATCHDOG_TIMEOUT_US {
-                warn!(
-                    "No network activity for {}s; forcing reconnect",
-                    WATCHDOG_TIMEOUT_US / 1_000_000
-                );
+            for tunnel in pool.tunnels.iter_mut() {
+                if now_wd.saturating_sub(tunnel.last_activity_at) >= WATCHDOG_TIMEOUT_US {
+                    warn!(
+                        "{}: no activity for {}s; marking unhealthy",
+                        tunnel.label(),
+                        WATCHDOG_TIMEOUT_US / 1_000_000,
+                    );
+                    tunnel.healthy = false;
+                }
+            }
+            if pool.all_unhealthy() {
+                warn!("All tunnels unhealthy; forcing reconnect");
                 break 'inner;
             }
         }
 
-        unsafe {
-            picoquic_close(cnx, 0);
+        // ── Cleanup: close all tunnel connections ────────────────────
+        for tunnel in pool.tunnels.iter_mut() {
+            unsafe {
+                picoquic_close(tunnel.cnx, 0);
+                (*tunnel.state_ptr).reset_for_reconnect();
+            }
         }
-
-        unsafe {
-            (*state_ptr).reset_for_reconnect();
+        // Drain stale commands from the shared accept channel.
+        let mut dropped = 0usize;
+        while let Ok(_cmd) = accept_rx.try_recv() {
+            dropped += 1;
         }
-        let dropped = drain_disconnected_commands(&mut command_rx);
+        // Also drain per-tunnel command channels.
+        for tunnel in pool.tunnels.iter_mut() {
+            while let Ok(_cmd) = tunnel.command_rx.try_recv() {
+                dropped += 1;
+            }
+        }
         if dropped > 0 {
             warn!("Dropped {} queued commands while reconnecting", dropped);
         }
         warn!(
-            "Connection closed; reconnecting in {}ms",
-            reconnect_delay.as_millis()
+            "Connection closed; reconnecting in {}ms ({})",
+            reconnect_delay.as_millis(),
+            pool.summary(),
         );
-        // Sleep in small chunks and drop commands that arrive while disconnected.
-        // Add jitter (up to 50% of base delay) to prevent thundering-herd on
-        // multi-client setups sharing the same resolver/domain.
         let jitter_us = unsafe { picoquic_current_time() };
         let base_ms = reconnect_delay.as_millis() as u64;
         let jitter_ms = jitter_us % (base_ms / 2 + 1);
@@ -792,7 +882,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
             let chunk = remaining_sleep.min(Duration::from_millis(100));
             sleep(chunk).await;
             remaining_sleep -= chunk;
-            let _ = drain_disconnected_commands(&mut command_rx);
+            while let Ok(_) = accept_rx.try_recv() {}
         }
         reconnect_delay = (reconnect_delay * 2).min(Duration::from_millis(RECONNECT_SLEEP_MAX_MS));
     }

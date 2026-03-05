@@ -1,118 +1,234 @@
-//! Periodic health checker for active resolvers.
+//! Per-tunnel health checker.
 //!
 //! Runs as a background tokio task.  Every `HEALTH_CHECK_INTERVAL` it
-//! probes every resolver currently known to the runtime by sending a
-//! real tunnel-encoded DNS query (reusing the scanner's probe logic).
+//! probes every tunnel currently known to the runtime by sending a
+//! real tunnel-encoded DNS query.
 //!
-//! Results are sent back to the runtime via a channel so the balancer
-//! can suspend / unsuspend resolvers without blocking the hot path.
+//! Each tunnel `(resolver, domain)` is probed independently — a domain
+//! failure through one resolver does not affect other tunnels.
+//!
+//! Results are sent back to the runtime via a channel so the pool can
+//! mark tunnels healthy/unhealthy without blocking the hot path.
 
-use super::scanner::{probe_candidate, ProbeResult};
+use slipstream_dns::{build_qname, decode_response, encode_query, QueryParams, CLASS_IN, RR_TXT};
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+// ── Probe constants ─────────────────────────────────────────────────
+
+/// Timeout for a single DNS health-check probe round-trip.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(2_500);
+
+// ── Probe types ─────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ProbeResult {
+    /// No response at all (timeout / error).
+    NoResponse,
+    /// Got a DNS response but wrong RCODE (NXDOMAIN, SERVFAIL, etc.).
+    WrongRcode,
+    /// Got RCODE=NOERROR — tunnel server answered.
+    TunnelReachable,
+    /// Got RCODE=NOERROR **and** TXT response contains data.
+    TunnelResponded,
+}
+
+/// Build a tunnel-realistic DNS TXT probe.
+fn build_tunnel_probe(domain: &str, id: u16) -> Result<Vec<u8>, String> {
+    let probe_marker: [u8; 8] = [
+        0x53, 0x4C, 0x50, 0x52, // "SLPR" magic
+        (id >> 8) as u8,
+        (id & 0xFF) as u8,
+        0x00,
+        0x01,
+    ];
+    let qname = build_qname(&probe_marker, domain).map_err(|e| e.to_string())?;
+    let params = QueryParams {
+        id,
+        qname: &qname,
+        qtype: RR_TXT,
+        qclass: CLASS_IN,
+        rd: true,
+        cd: false,
+        qdcount: 1,
+        is_query: true,
+    };
+    encode_query(&params).map_err(|e| e.to_string())
+}
+
+/// Probe a single resolver+domain with a tunnel-encoded DNS query.
+async fn probe_candidate(
+    addr: SocketAddr,
+    domain: &str,
+    id: u16,
+) -> (ProbeResult, Duration) {
+    let bind_addr: SocketAddr = if addr.is_ipv4() {
+        "0.0.0.0:0".parse().unwrap()
+    } else {
+        "[::]:0".parse().unwrap()
+    };
+
+    let sock = match UdpSocket::bind(bind_addr).await {
+        Ok(s) => s,
+        Err(e) => {
+            debug!("[health] probe: failed to bind socket: {e}");
+            return (ProbeResult::NoResponse, Duration::ZERO);
+        }
+    };
+
+    let query = match build_tunnel_probe(domain, id) {
+        Ok(q) => q,
+        Err(e) => {
+            debug!("[health] probe: failed to build probe: {e}");
+            return (ProbeResult::NoResponse, Duration::ZERO);
+        }
+    };
+
+    let start = Instant::now();
+    if let Err(e) = sock.send_to(&query, addr).await {
+        debug!("[health] probe: send_to {addr} failed: {e}");
+        return (ProbeResult::NoResponse, Duration::ZERO);
+    }
+
+    let mut buf = [0u8; 2048];
+    match tokio::time::timeout(PROBE_TIMEOUT, sock.recv_from(&mut buf)).await {
+        Ok(Ok((size, _))) if size >= 12 => {
+            let latency = start.elapsed();
+            let resp_id = u16::from_be_bytes([buf[0], buf[1]]);
+            let flags = u16::from_be_bytes([buf[2], buf[3]]);
+            let is_response = flags & 0x8000 != 0;
+            let rcode = (flags & 0x000F) as u8;
+
+            if !is_response || resp_id != id {
+                return (ProbeResult::NoResponse, latency);
+            }
+            if rcode != 0 {
+                return (ProbeResult::WrongRcode, latency);
+            }
+            if let Some(payload) = decode_response(&buf[..size]) {
+                debug!("[health] probe: {addr} NOERROR +{}B for {domain}", payload.len());
+                (ProbeResult::TunnelResponded, latency)
+            } else {
+                debug!("[health] probe: {addr} NOERROR (empty) for {domain}");
+                (ProbeResult::TunnelReachable, latency)
+            }
+        }
+        Ok(Ok((size, _))) => {
+            debug!("[health] probe: {addr} too-small response ({size}B)");
+            (ProbeResult::NoResponse, start.elapsed())
+        }
+        Ok(Err(e)) => {
+            debug!("[health] probe: recv from {addr} failed: {e}");
+            (ProbeResult::NoResponse, Duration::ZERO)
+        }
+        Err(_) => (ProbeResult::NoResponse, Duration::ZERO),
+    }
+}
+
 // ── Constants ───────────────────────────────────────────────────────
 
-/// How often we health-check all active resolvers.
+/// How often we health-check all active tunnels.
 const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
-/// A resolver must fail this many consecutive health checks before
-/// we tell the balancer to suspend it.
+/// A tunnel must fail this many consecutive health checks before
+/// we tell the pool to mark it unhealthy.
 const CONSECUTIVE_FAIL_THRESHOLD: u32 = 2;
 
-/// Maximum number of resolvers we health-check in a single round.
-/// Prevents the checker from consuming too many resources if the
-/// scanner has discovered thousands of resolvers.
-const MAX_CHECK_PER_ROUND: usize = 64;
+/// Maximum number of tunnels we health-check in a single round.
+const MAX_CHECK_PER_ROUND: usize = 128;
 
 // ── Public types ────────────────────────────────────────────────────
 
 /// A health-check result sent from the checker to the runtime.
 #[derive(Debug, Clone)]
 pub(crate) struct HealthUpdate {
-    /// Index of the resolver in the runtime's resolver list.
-    pub(crate) resolver_idx: usize,
-    /// Socket address (for logging / verification).
+    /// Tunnel ID in the runtime's TunnelPool.
+    pub(crate) tunnel_id: usize,
+    /// Socket address of the resolver (for logging / verification).
     pub(crate) addr: SocketAddr,
-    /// `true` = resolver is working, `false` = failed.
+    /// `true` = tunnel is working, `false` = failed.
     pub(crate) healthy: bool,
     /// Measured round-trip time (only meaningful when `healthy`).
     pub(crate) latency: Duration,
 }
 
-/// Snapshot of a resolver to probe — sent from the runtime to the
+/// Snapshot of a tunnel to probe — sent from the runtime to the
 /// health checker so it always has an up-to-date list.
 #[derive(Debug, Clone)]
-pub(crate) struct ResolverSnapshot {
-    pub(crate) idx: usize,
+pub(crate) struct TunnelSnapshot {
+    /// Tunnel ID in the pool.
+    pub(crate) tunnel_id: usize,
+    /// Resolver address for this tunnel.
     pub(crate) addr: SocketAddr,
+    /// Domain to use for the probe query.
+    pub(crate) domain: String,
 }
+
+/// Legacy alias kept for backward compatibility during transition.
+pub(crate) type ResolverSnapshot = TunnelSnapshot;
 
 // ── Background task ─────────────────────────────────────────────────
 
-/// Run the health checker loop.
+/// Run the per-tunnel health checker loop.
 ///
-/// * `resolver_rx` — receives the current resolver list from the runtime
-///   at the start of each round.
+/// * `tunnel_rx` — receives the current tunnel list from the runtime.
 /// * `result_tx` — sends health results back to the runtime.
-/// * `domains` — tunnel domains used for probe queries.
+/// * `_domains` — kept for signature compat; domain is now per-tunnel.
 pub(crate) async fn run_health_checker(
-    mut resolver_rx: mpsc::UnboundedReceiver<Vec<ResolverSnapshot>>,
+    mut tunnel_rx: mpsc::UnboundedReceiver<Vec<TunnelSnapshot>>,
     result_tx: mpsc::UnboundedSender<HealthUpdate>,
-    domains: Vec<String>,
+    _domains: Vec<String>,
 ) {
     info!(
-        "[health] checker started: interval={}s, fail_threshold={}",
+        "[health] per-tunnel checker started: interval={}s, fail_threshold={}",
         HEALTH_CHECK_INTERVAL.as_secs(),
         CONSECUTIVE_FAIL_THRESHOLD,
     );
 
-    // Per-resolver consecutive failure counter (keyed by resolver index).
-    // Reset whenever we get a fresh resolver list.
     let mut fail_counts: Vec<u32> = Vec::new();
-    let mut resolvers: Vec<ResolverSnapshot> = Vec::new();
+    let mut tunnels: Vec<TunnelSnapshot> = Vec::new();
 
     loop {
-        // Drain all pending resolver list updates — keep only the latest.
+        // Drain all pending tunnel list updates — keep only the latest.
         let mut got_update = false;
-        while let Ok(snapshot) = resolver_rx.try_recv() {
-            resolvers = snapshot;
+        while let Ok(snapshot) = tunnel_rx.try_recv() {
+            tunnels = snapshot;
             got_update = true;
         }
         if got_update {
-            // Resize fail counters to match new resolver list.
-            fail_counts.resize(resolvers.len(), 0);
+            fail_counts.resize(tunnels.len(), 0);
         }
 
-        if resolvers.is_empty() {
-            // No resolvers yet — wait a bit and check again.
+        if tunnels.is_empty() {
             tokio::time::sleep(Duration::from_secs(2)).await;
             continue;
         }
 
-        let check_count = resolvers.len().min(MAX_CHECK_PER_ROUND);
+        let check_count = tunnels.len().min(MAX_CHECK_PER_ROUND);
         debug!(
-            "[health] checking {}/{} resolvers",
+            "[health] checking {}/{} tunnels",
             check_count,
-            resolvers.len()
+            tunnels.len()
         );
 
         for i in 0..check_count {
-            let r = &resolvers[i];
-            let domain = &domains[i % domains.len()];
-            let id = ((r.idx as u32 * 7 + i as u32) % 65536) as u16;
+            let t = &tunnels[i];
+            let id = ((t.tunnel_id as u32 * 7 + i as u32) % 65536) as u16;
 
-            let (result, latency) = probe_candidate(r.addr, domain, id).await;
+            // Probe this tunnel with its own resolver + domain.
+            let (result, latency) = probe_candidate(t.addr, &t.domain, id).await;
             let is_healthy = result >= ProbeResult::TunnelReachable;
 
             if is_healthy {
                 if fail_counts.get(i).copied().unwrap_or(0) > 0 {
                     info!(
-                        "[health] resolver {} ({}) recovered ({}ms)",
-                        r.idx,
-                        r.addr,
+                        "[health] tunnel {} ({} via {}) recovered ({}ms)",
+                        t.tunnel_id,
+                        t.domain,
+                        t.addr,
                         latency.as_millis()
                     );
                 }
@@ -120,32 +236,35 @@ pub(crate) async fn run_health_checker(
                     *c = 0;
                 }
                 let _ = result_tx.send(HealthUpdate {
-                    resolver_idx: r.idx,
-                    addr: r.addr,
+                    tunnel_id: t.tunnel_id,
+                    addr: t.addr,
                     healthy: true,
                     latency,
                 });
             } else {
-                let count = fail_counts.get_mut(i).map(|c| {
-                    *c = c.saturating_add(1);
-                    *c
-                }).unwrap_or(1);
+                let count = fail_counts
+                    .get_mut(i)
+                    .map(|c| {
+                        *c = c.saturating_add(1);
+                        *c
+                    })
+                    .unwrap_or(1);
 
                 if count >= CONSECUTIVE_FAIL_THRESHOLD {
                     warn!(
-                        "[health] resolver {} ({}) failed {} consecutive checks — suspending",
-                        r.idx, r.addr, count
+                        "[health] tunnel {} ({} via {}) failed {} checks — suspending",
+                        t.tunnel_id, t.domain, t.addr, count
                     );
                     let _ = result_tx.send(HealthUpdate {
-                        resolver_idx: r.idx,
-                        addr: r.addr,
+                        tunnel_id: t.tunnel_id,
+                        addr: t.addr,
                         healthy: false,
                         latency: Duration::ZERO,
                     });
                 } else {
                     debug!(
-                        "[health] resolver {} ({}) failed check ({}/{})",
-                        r.idx, r.addr, count, CONSECUTIVE_FAIL_THRESHOLD
+                        "[health] tunnel {} ({} via {}) failed check ({}/{})",
+                        t.tunnel_id, t.domain, t.addr, count, CONSECUTIVE_FAIL_THRESHOLD
                     );
                 }
             }
