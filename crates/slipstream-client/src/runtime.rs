@@ -171,6 +171,12 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
         }
         reconnect_count += 1;
 
+        // ── Tunnel state storage ────────────────────────────────
+        // Declared BEFORE _quic_guard so it is dropped AFTER picoquic_delete.
+        // Rust drops in reverse declaration order; if states were freed first,
+        // picoquic_delete would fire close callbacks on dangling pointers → SEGV.
+        let mut _tunnel_states: Vec<Box<ClientState>> = Vec::new();
+
         let mut local_addr_storage = socket_addr_to_storage(udp.local_addr().map_err(map_io)?);
 
         let current_time = unsafe { picoquic_current_time() };
@@ -228,9 +234,6 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
 
         // ── Create one tunnel per (resolver, domain) pair ───────────
         let mut pool = TunnelPool::new();
-        // Keep Box<ClientState> alive alongside the pool so pointers
-        // stay valid.  Dropped when we break out of the inner loop.
-        let mut _tunnel_states: Vec<Box<ClientState>> = Vec::new();
 
         for (ri, base_res) in base_resolvers.iter().enumerate() {
             for (di, domain) in config.domains.iter().enumerate() {
