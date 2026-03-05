@@ -104,6 +104,7 @@ fn path_peer_addr(cnx: *mut picoquic_cnx_t, unique_path_id: u64) -> Option<Socke
     sockaddr_storage_to_socket_addr(&storage).ok()
 }
 
+#[allow(dead_code)]
 pub(crate) fn loop_burst_total(resolvers: &[ResolverState], base: usize) -> usize {
     resolvers.iter().fold(0usize, |acc, resolver| {
         acc.saturating_add(base.saturating_mul(path_loop_multiplier(resolver.mode)))
@@ -121,6 +122,7 @@ fn path_loop_multiplier(mode: ResolverMode) -> usize {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn find_resolver_by_addr_mut(
     resolvers: &mut [ResolverState],
     addr: SocketAddr,
@@ -140,6 +142,7 @@ fn find_resolver_by_addr_with_index(
         .find(|(_, resolver)| resolver.addr == addr)
 }
 
+#[allow(dead_code)]
 fn find_resolver_by_unique_id_mut(
     resolvers: &mut [ResolverState],
     unique_path_id: u64,

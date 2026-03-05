@@ -9,7 +9,9 @@ use tracing::{info, warn};
 
 use super::resolver::{reset_resolver_path, ResolverState};
 
+#[allow(dead_code)]
 const PATH_PROBE_INITIAL_DELAY_US: u64 = 250_000;
+#[allow(dead_code)]
 const PATH_PROBE_MAX_DELAY_US: u64 = 10_000_000;
 
 pub(crate) fn refresh_resolver_path(
@@ -43,6 +45,7 @@ pub(crate) fn refresh_resolver_path(
     true
 }
 
+#[allow(dead_code)]
 pub(crate) fn add_paths(
     cnx: *mut picoquic_cnx_t,
     resolvers: &mut [ResolverState],
@@ -114,6 +117,7 @@ pub(crate) fn resolver_mode_to_c(mode: ResolverMode) -> libc::c_int {
     }
 }
 
+#[allow(dead_code)]
 fn path_probe_backoff(attempts: u32) -> u64 {
     let shift = attempts.saturating_sub(1).min(6);
     let delay = PATH_PROBE_INITIAL_DELAY_US.saturating_mul(1u64 << shift);

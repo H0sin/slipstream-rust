@@ -143,6 +143,7 @@ impl TunnelPool {
     }
 
     /// Find tunnel indices for a given resolver address.
+    #[allow(dead_code)]
     pub(crate) fn find_by_resolver_addr(
         &self,
         addr: std::net::SocketAddr,
@@ -162,6 +163,7 @@ impl TunnelPool {
     }
 
     /// Whether any tunnel is ready.
+    #[allow(dead_code)]
     pub(crate) fn any_ready(&self) -> bool {
         self.tunnels.iter().any(|t| t.is_ready())
     }

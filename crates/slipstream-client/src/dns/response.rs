@@ -15,6 +15,7 @@ use slipstream_core::normalize_dual_stack_addr;
 
 const MAX_POLL_BURST: usize = PICOQUIC_PACKET_LOOP_RECV_MAX;
 
+#[allow(dead_code)]
 pub(crate) struct DnsResponseContext<'a> {
     pub(crate) quic: *mut picoquic_quic_t,
     pub(crate) local_addr_storage: &'a libc::sockaddr_storage,
@@ -22,6 +23,7 @@ pub(crate) struct DnsResponseContext<'a> {
     pub(crate) balancer: &'a mut DomainBalancer,
 }
 
+#[allow(dead_code)]
 pub(crate) fn handle_dns_response(
     buf: &[u8],
     peer: SocketAddr,
@@ -123,6 +125,7 @@ pub(crate) fn handle_dns_response(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn find_resolver_by_path_id(
     resolvers: &mut [ResolverState],
     path_id: libc::c_int,
@@ -135,6 +138,7 @@ fn find_resolver_by_path_id(
         .find(|resolver| resolver.added && resolver.path_id == path_id)
 }
 
+#[allow(dead_code)]
 fn find_resolver_by_addr(
     resolvers: &mut [ResolverState],
     peer: SocketAddr,

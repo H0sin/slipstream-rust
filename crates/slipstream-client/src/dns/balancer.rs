@@ -152,6 +152,7 @@ impl RouteHealth {
     }
 
     /// Advance the cooldown for a failed probe.
+    #[allow(dead_code)]
     fn advance_cooldown(&mut self) {
         let now = Instant::now();
         let cooldown = compute_cooldown(self.cooldown_exponent);
@@ -198,11 +199,13 @@ impl DomainBalancer {
     }
 
     /// Total number of domains.
+    #[allow(dead_code)]
     pub(crate) fn num_domains(&self) -> usize {
         self.domains.len()
     }
 
     /// Current number of resolvers.
+    #[allow(dead_code)]
     pub(crate) fn num_resolvers(&self) -> usize {
         self.num_resolvers
     }
@@ -255,12 +258,14 @@ impl DomainBalancer {
     }
 
     /// Returns all domain strings.
+    #[allow(dead_code)]
     pub(crate) fn domains(&self) -> &[String] {
         &self.domains
     }
 
     /// The minimum MTU across all domains (conservative for QUIC).
     /// Uses the same formula as the client runtime: (240 - domain_len) / 1.6
+    #[allow(dead_code)]
     pub(crate) fn min_mtu(&self) -> u32 {
         self.domains
             .iter()
@@ -330,6 +335,7 @@ impl DomainBalancer {
 
     /// Select a (resolver_index, domain_index) pair from all routes,
     /// useful when the caller wants to spread across resolvers too.
+    #[allow(dead_code)]
     pub(crate) fn select_route(&mut self) -> (usize, usize) {
         let now = Instant::now();
         let total = self.routes.len();
@@ -393,6 +399,7 @@ impl DomainBalancer {
     }
 
     /// Record a failed probe for an unhealthy route (extends cooldown).
+    #[allow(dead_code)]
     pub(crate) fn record_probe_failure(&mut self, resolver_idx: usize, domain_idx: usize) {
         if let Some(route) = self.route_mut(resolver_idx, domain_idx) {
             route.advance_cooldown();
@@ -400,6 +407,7 @@ impl DomainBalancer {
     }
 
     /// Check whether a specific resolver has any healthy route at all.
+    #[allow(dead_code)]
     pub(crate) fn resolver_has_healthy_route(&self, resolver_idx: usize) -> bool {
         let num_domains = self.domains.len();
         let base = resolver_idx * num_domains;

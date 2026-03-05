@@ -148,10 +148,12 @@ pub(crate) struct HealthUpdate {
     /// Tunnel ID in the runtime's TunnelPool.
     pub(crate) tunnel_id: usize,
     /// Socket address of the resolver (for logging / verification).
+    #[allow(dead_code)]
     pub(crate) addr: SocketAddr,
     /// `true` = tunnel is working, `false` = failed.
     pub(crate) healthy: bool,
     /// Measured round-trip time (only meaningful when `healthy`).
+    #[allow(dead_code)]
     pub(crate) latency: Duration,
 }
 
@@ -168,6 +170,7 @@ pub(crate) struct TunnelSnapshot {
 }
 
 /// Legacy alias kept for backward compatibility during transition.
+#[allow(dead_code)]
 pub(crate) type ResolverSnapshot = TunnelSnapshot;
 
 // ── Background task ─────────────────────────────────────────────────

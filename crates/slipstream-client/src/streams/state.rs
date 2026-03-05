@@ -57,6 +57,7 @@ impl StreamRecvState {
 }
 
 #[derive(Default)]
+#[allow(dead_code)]
 pub(crate) struct ClientStreamMetrics {
     pub(crate) streams_with_rx_queued: usize,
     pub(crate) queued_bytes_total: u64,
@@ -130,6 +131,7 @@ impl ClientState {
         (self.debug_enqueued_bytes, self.debug_last_enqueue_at)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn stream_debug_metrics(&self) -> ClientStreamMetrics {
         let mut metrics = ClientStreamMetrics::default();
         for stream in self.streams.values() {
@@ -159,6 +161,7 @@ impl ClientState {
         metrics
     }
 
+    #[allow(dead_code)]
     pub(crate) fn stream_backlog_summaries(&self, limit: usize) -> Vec<ClientBacklogSummary> {
         let mut summaries = Vec::new();
         for (stream_id, stream) in self.streams.iter() {

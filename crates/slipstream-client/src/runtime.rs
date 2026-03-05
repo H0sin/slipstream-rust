@@ -60,6 +60,7 @@ fn is_ipv6_unspecified(host: &str) -> bool {
         .unwrap_or(false)
 }
 
+#[allow(dead_code)]
 fn drain_disconnected_commands(command_rx: &mut mpsc::UnboundedReceiver<Command>) -> usize {
     let mut dropped = 0usize;
     while let Ok(command) = command_rx.try_recv() {
