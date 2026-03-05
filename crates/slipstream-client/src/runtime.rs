@@ -339,7 +339,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
         let mut zero_send_loops = 0u64;
         let mut zero_send_with_streams = 0u64;
         let mut last_flow_block_log_at = 0u64;
-        let mut last_activity_at = unsafe { picoquic_current_time() };
+        let _last_activity_at = unsafe { picoquic_current_time() };
         let mut last_health_snapshot_at = std::time::Instant::now();
         const HEALTH_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -624,7 +624,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
 
                 // Map last_cnx → tunnel to determine which domain to use.
                 let tunnel_idx = pool.find_by_cnx(last_cnx);
-                let selected_domain = if let Some(ti) = tunnel_idx {
+                let (selected_domain, dns_id_for_pkt) = if let Some(ti) = tunnel_idx {
                     let tunnel = &mut pool.tunnels[ti];
                     tunnel.resolver.local_addr_storage =
                         Some(unsafe { std::ptr::read(&addr_from) });
@@ -635,21 +635,17 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                         .debug
                         .send_bytes
                         .saturating_add(send_length as u64);
-                    tunnel.domain.as_str()
+                    let domain = tunnel.domain.clone();
+                    let id = tunnel.dns_id;
+                    tunnel.dns_id = id.wrapping_add(1);
+                    (domain, id)
                 } else {
                     // Fallback: first domain (should not happen in normal operation).
-                    config.domains.first().map(|d| d.as_str()).unwrap_or("unknown.com")
+                    let domain = config.domains.first().cloned().unwrap_or_else(|| "unknown.com".to_string());
+                    (domain, 0)
                 };
 
-                let dns_id_for_pkt = if let Some(ti) = tunnel_idx {
-                    let id = pool.tunnels[ti].dns_id;
-                    pool.tunnels[ti].dns_id = pool.tunnels[ti].dns_id.wrapping_add(1);
-                    id
-                } else {
-                    0
-                };
-
-                let qname = match build_qname(&send_buf[..send_length], selected_domain) {
+                let qname = match build_qname(&send_buf[..send_length], &selected_domain) {
                     Ok(q) => q,
                     Err(err) => {
                         warn!("Failed to build DNS query name: {err}; skipping packet");
@@ -819,13 +815,14 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                     }
                     ResolverMode::Recursive => tunnel.resolver.pending_polls,
                 };
+                let snap = tunnel.resolver.last_pacing_snapshot;
                 maybe_report_debug(
                     &mut tunnel.resolver,
                     report_time,
                     streams_len,
                     pending_for_debug,
                     inflight_polls,
-                    tunnel.resolver.last_pacing_snapshot,
+                    snap,
                 );
             }
 
