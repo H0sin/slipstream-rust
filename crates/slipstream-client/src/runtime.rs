@@ -42,7 +42,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Notify};
 use tokio::time::sleep;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 // Protocol defaults; see docs/config.md for details.
 const SLIPSTREAM_ALPN: &str = "picoquic_sample";
@@ -428,6 +428,22 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
             while let Ok(update) = health_result_rx.try_recv() {
                 if let Some(tunnel) = pool.tunnels.get_mut(update.tunnel_id) {
                     let was_healthy = tunnel.healthy;
+                    if !update.healthy {
+                        // Don't kill an active tunnel just because a probe timed out.
+                        // If data flowed recently (within 2× health-check interval),
+                        // the QUIC path is obviously alive.
+                        let now_us = unsafe { picoquic_current_time() };
+                        let idle_us = now_us.saturating_sub(tunnel.last_activity_at);
+                        let grace_us = 60_000_000; // 60 s
+                        if idle_us < grace_us {
+                            debug!(
+                                "{}: health probe failed but tunnel active {}s ago — ignoring",
+                                tunnel.label(),
+                                idle_us / 1_000_000,
+                            );
+                            continue;
+                        }
+                    }
                     tunnel.healthy = update.healthy;
                     if update.healthy && !was_healthy {
                         info!("{}: recovered", tunnel.label());

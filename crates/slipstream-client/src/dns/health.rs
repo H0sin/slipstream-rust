@@ -20,7 +20,8 @@ use tracing::{debug, info, warn};
 // ── Probe constants ─────────────────────────────────────────────────
 
 /// Timeout for a single DNS health-check probe round-trip.
-const PROBE_TIMEOUT: Duration = Duration::from_millis(2_500);
+/// Recursive resolvers (e.g. 8.8.8.8) may need extra time.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(5_000);
 
 // ── Probe types ─────────────────────────────────────────────────────
 
@@ -135,7 +136,7 @@ const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
 /// A tunnel must fail this many consecutive health checks before
 /// we tell the pool to mark it unhealthy.
-const CONSECUTIVE_FAIL_THRESHOLD: u32 = 2;
+const CONSECUTIVE_FAIL_THRESHOLD: u32 = 4;
 
 /// Maximum number of tunnels we health-check in a single round.
 const MAX_CHECK_PER_ROUND: usize = 128;
