@@ -258,7 +258,7 @@ pub(crate) fn handle_dns_response_tunneled(
 
         Ok(resolved_tunnel)
     } else if let Some(response_id) = response_id {
-        // Empty response — find tunnel and record failure.
+        // Empty response — find tunnel and update stats.
         let tunnel_idx_by_addr = tunnels
             .iter()
             .position(|t| t.resolver.addr == peer);
@@ -269,9 +269,14 @@ pub(crate) fn handle_dns_response_tunneled(
             if resolver.mode == ResolverMode::Authoritative {
                 resolver.inflight_poll_ids.remove(&response_id);
             }
-            let ri = tunnels[ti].resolver_idx;
-            let di = tunnels[ti].domain_idx;
-            ctx.balancer.record_failure(ri, di);
+            // Only count as failure if the QUIC handshake is already done.
+            // During handshake, empty responses are normal and should not
+            // penalise the route health.
+            if tunnels[ti].is_ready() {
+                let ri = tunnels[ti].resolver_idx;
+                let di = tunnels[ti].domain_idx;
+                ctx.balancer.record_failure(ri, di);
+            }
         }
 
         Ok(tunnel_idx_by_addr)

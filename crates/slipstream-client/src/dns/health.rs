@@ -254,9 +254,10 @@ pub(crate) async fn run_health_checker(
                     })
                     .unwrap_or(1);
 
-                if count >= CONSECUTIVE_FAIL_THRESHOLD {
+                if count == CONSECUTIVE_FAIL_THRESHOLD {
+                    // First time hitting threshold — warn and notify runtime.
                     warn!(
-                        "[health] tunnel {} ({} via {}) failed {} checks — suspending",
+                        "[health] tunnel {} ({} via {}) failed {} consecutive checks — suspending",
                         t.tunnel_id, t.domain, t.addr, count
                     );
                     let _ = result_tx.send(HealthUpdate {
@@ -265,6 +266,12 @@ pub(crate) async fn run_health_checker(
                         healthy: false,
                         latency: Duration::ZERO,
                     });
+                } else if count > CONSECUTIVE_FAIL_THRESHOLD {
+                    // Already suspended — only log at debug to avoid spam.
+                    debug!(
+                        "[health] tunnel {} ({} via {}) still failing ({} checks)",
+                        t.tunnel_id, t.domain, t.addr, count
+                    );
                 } else {
                     debug!(
                         "[health] tunnel {} ({} via {}) failed check ({}/{})",
