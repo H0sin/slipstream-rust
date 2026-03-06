@@ -55,6 +55,7 @@ const FLOW_BLOCKED_LOG_INTERVAL_US: u64 = 1_000_000;
 const WATCHDOG_TIMEOUT_US: u64 = 60_000_000;
 /// Idle recursive tunnels send a keepalive poll every this many µs.
 const KEEPALIVE_POLL_INTERVAL_US: u64 = 10_000_000;
+const HEARTBEAT_INTERVAL_US: u64 = 60_000_000;
 
 fn is_ipv6_unspecified(host: &str) -> bool {
     host.parse::<Ipv6Addr>()
@@ -346,6 +347,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
         let mut zero_send_with_streams = 0u64;
         let mut last_flow_block_log_at = 0u64;
         let _last_activity_at = unsafe { picoquic_current_time() };
+        let mut last_heartbeat_at = unsafe { picoquic_current_time() };
         let mut last_health_snapshot_at = std::time::Instant::now();
         const HEALTH_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -730,8 +732,6 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                         warn!("Non-transient UDP send error: {err}; will reconnect");
                         break 'inner;
                     }
-                } else if let Some(ti) = tunnel_idx {
-                    pool.tunnels[ti].last_activity_at = unsafe { picoquic_current_time() };
                 }
             }
 
@@ -838,11 +838,11 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                                 warn!("{}: poll query failed: {e}; marking unhealthy", tunnel.label());
                                 pool.tunnels[tunnel_idx].healthy = false;
                             } else {
+                                let sent = to_send_count.saturating_sub(to_send);
                                 tunnel.resolver.pending_polls = tunnel
                                     .resolver
                                     .pending_polls
-                                    .saturating_sub(to_send_count)
-                                    .saturating_add(to_send);
+                                    .saturating_sub(sent);
                             }
                         }
                     }
@@ -887,8 +887,20 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 );
             }
 
-            // ── Per-tunnel watchdog ──────────────────────────────────
+            // ── Periodic heartbeat (diagnostics) ─────────────────────
             let now_wd = unsafe { picoquic_current_time() };
+            if now_wd.saturating_sub(last_heartbeat_at) >= HEARTBEAT_INTERVAL_US {
+                last_heartbeat_at = now_wd;
+                let healthy_count = pool.tunnels.iter().filter(|t| t.healthy).count();
+                let ready_count = pool.tunnels.iter().filter(|t| t.is_ready()).count();
+                let total_streams = pool.total_streams();
+                info!(
+                    "heartbeat: tunnels={} healthy={} ready={} streams={}",
+                    pool.tunnels.len(), healthy_count, ready_count, total_streams,
+                );
+            }
+
+            // ── Per-tunnel watchdog ──────────────────────────────────
             for tunnel in pool.tunnels.iter_mut() {
                 // Only warn once — skip tunnels already marked unhealthy.
                 if tunnel.healthy
