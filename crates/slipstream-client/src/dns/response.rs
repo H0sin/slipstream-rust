@@ -104,7 +104,7 @@ pub(crate) fn handle_dns_response(
             }
         }
     } else if let Some(response_id) = response_id {
-        let resolver_index = ctx
+        let _resolver_index = ctx
             .resolvers
             .iter()
             .position(|resolver| resolver.addr == peer);
@@ -114,13 +114,8 @@ pub(crate) fn handle_dns_response(
                 resolver.inflight_poll_ids.remove(&response_id);
             }
         }
-        // Empty response (no payload) — record failure for balancer health.
-        if let Some(ri) = resolver_index {
-            let num_domains = ctx.balancer.num_domains();
-            for d in 0..num_domains {
-                ctx.balancer.record_failure(ri, d);
-            }
-        }
+        // Empty responses are normal in DNS tunneling — don't
+        // penalise the route.  Health is tracked elsewhere.
     }
     Ok(())
 }
@@ -269,14 +264,10 @@ pub(crate) fn handle_dns_response_tunneled(
             if resolver.mode == ResolverMode::Authoritative {
                 resolver.inflight_poll_ids.remove(&response_id);
             }
-            // Only count as failure if the QUIC handshake is already done.
-            // During handshake, empty responses are normal and should not
-            // penalise the route health.
-            if tunnels[ti].is_ready() {
-                let ri = tunnels[ti].resolver_idx;
-                let di = tunnels[ti].domain_idx;
-                ctx.balancer.record_failure(ri, di);
-            }
+            // Empty responses are normal in DNS tunneling (recursive
+            // resolvers often return NOERROR without TXT payload).
+            // Don't penalise the route — actual health is tracked by
+            // the background health checker and QUIC watchdog.
         }
 
         Ok(tunnel_idx_by_addr)

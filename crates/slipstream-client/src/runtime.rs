@@ -383,9 +383,15 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 drain_stream_data(tunnel.cnx, tunnel.state_ptr);
             }
 
-            // Break if any tunnel is closing (full reconnect).
-            if pool.any_closing() {
-                break 'inner;
+            // Mark closing tunnels as unhealthy so the pool skips them.
+            // Only force a full reconnect if ALL tunnels are closing/dead
+            // (handled by the all_unhealthy check later).
+            for tunnel in pool.tunnels.iter_mut() {
+                if tunnel.is_closing() && tunnel.healthy {
+                    warn!("{}: connection closed — marking unhealthy", tunnel.label());
+                    tunnel.healthy = false;
+                    balancer.suspend_resolver(tunnel.resolver_idx);
+                }
             }
 
             // ── Per-tunnel readiness updates ─────────────────────────
