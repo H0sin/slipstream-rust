@@ -35,10 +35,10 @@ use crate::streams::{
 // Protocol defaults; see docs/config.md for details.
 const SLIPSTREAM_ALPN: &str = "picoquic_sample";
 const DNS_MAX_QUERY_SIZE: usize = 512;
-const IDLE_SLEEP_MS: u64 = 2;
+const IDLE_SLEEP_MS: u64 = 10;
 const IDLE_GC_INTERVAL: Duration = Duration::from_secs(1);
 // Default QUIC MTU for server packets; see docs/config.md for details.
-const QUIC_MTU: u32 = 1200;
+const QUIC_MTU: u32 = 900;
 pub(crate) const STREAM_READ_CHUNK_BYTES: usize = 4096;
 pub(crate) const DEFAULT_TCP_RCVBUF_BYTES: usize = 256 * 1024;
 pub(crate) const TARGET_WRITE_COALESCE_DEFAULT_BYTES: usize = 256 * 1024;

@@ -53,6 +53,7 @@ pub(crate) fn drain_path_events(
     resolvers: &mut [ResolverState],
     state_ptr: *mut ClientState,
     balancer: &mut DomainBalancer,
+    pool_resolver_idx: Option<usize>,
 ) {
     if state_ptr.is_null() {
         return;
@@ -65,7 +66,7 @@ pub(crate) fn drain_path_events(
         match event {
             PathEvent::Available(unique_path_id) => {
                 if let Some(addr) = path_peer_addr(cnx, unique_path_id) {
-                    if let Some((idx, resolver)) = find_resolver_by_addr_with_index(resolvers, addr) {
+                    if let Some((_local_idx, resolver)) = find_resolver_by_addr_with_index(resolvers, addr) {
                         let path_id =
                             unsafe { slipstream_get_path_id_from_unique(cnx, unique_path_id) };
                         if path_id >= 0 {
@@ -73,7 +74,11 @@ pub(crate) fn drain_path_events(
                             resolver.path_id = path_id;
                             resolver.added = true;
                             // Path came back — unsuspend in balancer.
-                            balancer.unsuspend_resolver(idx);
+                            // Use pool_resolver_idx when available (per-tunnel
+                            // call) so we unsuspend the correct resolver even
+                            // when the slice has only one element.
+                            let balancer_idx = pool_resolver_idx.unwrap_or(_local_idx);
+                            balancer.unsuspend_resolver(balancer_idx);
                         } else {
                             resolver.unique_path_id = None;
                         }
@@ -81,14 +86,15 @@ pub(crate) fn drain_path_events(
                 }
             }
             PathEvent::Deleted(unique_path_id) => {
-                if let Some((idx, resolver)) = find_resolver_by_unique_id_with_index(resolvers, unique_path_id) {
+                if let Some((_local_idx, resolver)) = find_resolver_by_unique_id_with_index(resolvers, unique_path_id) {
                     reset_resolver_path(resolver);
+                    let balancer_idx = pool_resolver_idx.unwrap_or(_local_idx);
                     // Path lost — suspend all routes for this resolver.
                     info!(
-                        "Path deleted for resolver {} (idx={}) — suspending in balancer",
-                        resolver.addr, idx
+                        "Path deleted for resolver {} (balancer_idx={}) — suspending in balancer",
+                        resolver.addr, balancer_idx,
                     );
-                    balancer.suspend_resolver(idx);
+                    balancer.suspend_resolver(balancer_idx);
                 }
             }
         }

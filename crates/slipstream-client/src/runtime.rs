@@ -355,13 +355,20 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 if let Command::NewStream { stream, reservation } = cmd {
                     if let Some(idx) = pool.select_tunnel() {
                         let t = &mut pool.tunnels[idx];
+                        info!(
+                            "Dispatching TCP connection to {}: ready={} streams={}",
+                            t.label(), t.is_ready(), t.streams_len(),
+                        );
                         handle_command(
                             t.cnx,
                             t.state_ptr,
                             Command::NewStream { stream, reservation },
                         );
                     } else {
-                        warn!("No healthy tunnel available; dropping TCP connection");
+                        warn!(
+                            "No healthy tunnel available; dropping TCP connection ({})",
+                            pool.summary(),
+                        );
                         drop(stream);
                     }
                 }
@@ -398,6 +405,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                     std::slice::from_mut(&mut tunnel.resolver),
                     tunnel.state_ptr,
                     &mut balancer,
+                    Some(tunnel.resolver_idx),
                 );
             }
 
@@ -487,9 +495,13 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                     if let Some(Command::NewStream { stream, reservation }) = cmd {
                         if let Some(idx) = pool.select_tunnel() {
                             let t = &mut pool.tunnels[idx];
+                            info!(
+                                "Dispatching TCP connection (select) to {}: ready={} streams={}",
+                                t.label(), t.is_ready(), t.streams_len(),
+                            );
                             handle_command(t.cnx, t.state_ptr, Command::NewStream { stream, reservation });
                         } else {
-                            warn!("No healthy tunnel; dropping TCP connection");
+                            warn!("No healthy tunnel; dropping TCP connection ({})", pool.summary());
                         }
                     }
                 }
@@ -570,6 +582,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                     std::slice::from_mut(&mut tunnel.resolver),
                     tunnel.state_ptr,
                     &mut balancer,
+                    Some(tunnel.resolver_idx),
                 );
             }
 

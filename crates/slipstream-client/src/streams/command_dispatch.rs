@@ -17,7 +17,7 @@ use slipstream_ffi::picoquic::{
 };
 use slipstream_ffi::{abort_stream_bidi, SLIPSTREAM_INTERNAL_ERROR};
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 fn command_generation_matches(
     state: &ClientState,
@@ -198,7 +198,7 @@ pub(crate) fn handle_command(
             if state.debug_streams {
                 debug!("stream {}: accepted", stream_id);
             } else {
-                debug!("Accepted TCP stream {}", stream_id);
+                info!("Accepted TCP stream {} (total={})", stream_id, state.streams.len());
             }
             check_stream_invariants(state, stream_id, "NewStream");
         }
