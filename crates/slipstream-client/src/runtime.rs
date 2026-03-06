@@ -52,7 +52,9 @@ const DNS_POLL_SLICE_US: u64 = 20_000;
 const RECONNECT_SLEEP_MIN_MS: u64 = 250;
 const RECONNECT_SLEEP_MAX_MS: u64 = 5_000;
 const FLOW_BLOCKED_LOG_INTERVAL_US: u64 = 1_000_000;
-const WATCHDOG_TIMEOUT_US: u64 = 30_000_000;
+const WATCHDOG_TIMEOUT_US: u64 = 60_000_000;
+/// Idle recursive tunnels send a keepalive poll every this many µs.
+const KEEPALIVE_POLL_INTERVAL_US: u64 = 10_000_000;
 
 fn is_ipv6_unspecified(host: &str) -> bool {
     host.parse::<Ipv6Addr>()
@@ -756,6 +758,10 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
             // ── Per-tunnel poll queries ──────────────────────────────
             for tunnel_idx in 0..pool.tunnels.len() {
                 let tunnel = &mut pool.tunnels[tunnel_idx];
+                // Skip dead tunnels — don't waste DNS queries.
+                if tunnel.is_closing() || !tunnel.healthy {
+                    continue;
+                }
                 if !refresh_resolver_path(tunnel.cnx, &mut tunnel.resolver) {
                     continue;
                 }
@@ -801,6 +807,16 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                     }
                     ResolverMode::Recursive => {
                         tunnel.resolver.last_pacing_snapshot = None;
+                        // Keepalive: idle recursive tunnels need at least 1
+                        // poll periodically so the QUIC connection stays warm
+                        // and the watchdog doesn't kill them.
+                        if tunnel.resolver.pending_polls == 0 && tunnel.is_ready() {
+                            let now_ka = unsafe { picoquic_current_time() };
+                            let idle_us = now_ka.saturating_sub(tunnel.last_activity_at);
+                            if idle_us >= KEEPALIVE_POLL_INTERVAL_US {
+                                tunnel.resolver.pending_polls = 1;
+                            }
+                        }
                         if tunnel.resolver.pending_polls > 0 {
                             let burst_max = path_poll_burst_max(&tunnel.resolver);
                             let to_send_count = tunnel.resolver.pending_polls.min(burst_max);
