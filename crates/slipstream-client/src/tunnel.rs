@@ -158,6 +158,7 @@ impl TunnelPool {
     }
 
     /// Whether any tunnel is in the closing state.
+    #[allow(dead_code)]
     pub(crate) fn any_closing(&self) -> bool {
         self.tunnels.iter().any(|t| t.is_closing())
     }

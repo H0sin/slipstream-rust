@@ -392,6 +392,7 @@ impl DomainBalancer {
     }
 
     /// Record a failure (timeout, error) for a (resolver, domain) route.
+    #[allow(dead_code)]
     pub(crate) fn record_failure(&mut self, resolver_idx: usize, domain_idx: usize) {
         if let Some(route) = self.route_mut(resolver_idx, domain_idx) {
             route.record_failure();
