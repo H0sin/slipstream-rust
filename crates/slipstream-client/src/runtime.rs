@@ -874,7 +874,10 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
             // ── Per-tunnel watchdog ──────────────────────────────────
             let now_wd = unsafe { picoquic_current_time() };
             for tunnel in pool.tunnels.iter_mut() {
-                if now_wd.saturating_sub(tunnel.last_activity_at) >= WATCHDOG_TIMEOUT_US {
+                // Only warn once — skip tunnels already marked unhealthy.
+                if tunnel.healthy
+                    && now_wd.saturating_sub(tunnel.last_activity_at) >= WATCHDOG_TIMEOUT_US
+                {
                     warn!(
                         "{}: no activity for {}s; marking unhealthy",
                         tunnel.label(),
