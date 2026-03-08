@@ -33,6 +33,9 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+/// IPs to probe per scan round (picked randomly from a random range).
+const BATCH_SIZE: usize = 50;
+
 /// Delay between consecutive probes within a batch.
 const INTER_PROBE_DELAY: Duration = Duration::from_millis(100);
 
@@ -47,7 +50,7 @@ const REVALIDATE_EVERY_N_ROUNDS: u32 = 3;
 
 /// A parsed IP range with an optional port override.
 #[derive(Debug, Clone)]
-pub(crate) struct IpRange {
+struct IpRange {
     start: u32, // IPv4 as u32 (network order)
     end: u32,   // inclusive
     port: u16,
