@@ -43,6 +43,10 @@ pub(crate) const STREAM_READ_CHUNK_BYTES: usize = 4096;
 pub(crate) const DEFAULT_TCP_RCVBUF_BYTES: usize = 256 * 1024;
 pub(crate) const TARGET_WRITE_COALESCE_DEFAULT_BYTES: usize = 256 * 1024;
 const FLOW_BLOCKED_LOG_INTERVAL_US: u64 = 1_000_000;
+/// If a connection has a send backlog for this long, kill it.
+const STALL_KILL_TIMEOUT: Duration = Duration::from_secs(30);
+/// Stream count threshold to consider a connection stalled.
+const STALL_STREAM_THRESHOLD: usize = 100;
 
 static SHOULD_SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
@@ -283,6 +287,7 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
     let mut last_seen = HashMap::new();
     let mut last_idle_gc = Instant::now();
     let mut last_flow_block_log_at: u64 = 0;
+    let mut stall_first_seen: HashMap<usize, Instant> = HashMap::new();
 
     loop {
         drain_commands(state_ptr, &mut command_rx);
@@ -417,38 +422,66 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
                     let metrics = unsafe { (&*state_ptr).stream_debug_metrics(cnx_id) };
                     if metrics.streams_total > 0
                         && metrics.has_send_backlog()
-                        && loop_time.saturating_sub(last_flow_block_log_at)
-                            >= FLOW_BLOCKED_LOG_INTERVAL_US
                     {
-                        let flow_blocked = unsafe { slipstream_is_flow_blocked(slot.cnx) != 0 };
-                        let has_ready_stream =
-                            unsafe { slipstream_has_ready_stream(slot.cnx) != 0 };
-                        let send_backlog =
-                            unsafe { (&*state_ptr).stream_send_backlog_summaries(cnx_id, 8) };
-                        tracing::warn!(
-                            "server connection stalled: cnx={} streams={} streams_with_write_tx={} streams_with_data_rx={} queued_bytes_total={} streams_with_pending_data={} pending_chunks_total={} pending_bytes_total={} streams_with_pending_fin={} streams_with_fin_enqueued={} streams_with_target_fin_pending={} streams_with_send_pending={} streams_with_send_stash={} send_stash_bytes_total={} streams_discarding={} streams_close_after_flush={} multi_stream={} flow_blocked={} has_ready_stream={} send_backlog={:?}",
-                            cnx_id,
-                            metrics.streams_total,
-                            metrics.streams_with_write_tx,
-                            metrics.streams_with_data_rx,
-                            metrics.queued_bytes_total,
-                            metrics.streams_with_pending_data,
-                            metrics.pending_chunks_total,
-                            metrics.pending_bytes_total,
-                            metrics.streams_with_pending_fin,
-                            metrics.streams_with_fin_enqueued,
-                            metrics.streams_with_target_fin_pending,
-                            metrics.streams_with_send_pending,
-                            metrics.streams_with_send_stash,
-                            metrics.send_stash_bytes_total,
-                            metrics.streams_discarding,
-                            metrics.streams_close_after_flush,
-                            metrics.multi_stream,
-                            flow_blocked,
-                            has_ready_stream,
-                            send_backlog
-                        );
-                        last_flow_block_log_at = loop_time;
+                        // Track how long this connection has been stalled.
+                        let stall_start = *stall_first_seen
+                            .entry(cnx_id)
+                            .or_insert(Instant::now());
+                        let stall_duration = Instant::now().duration_since(stall_start);
+
+                        if metrics.streams_total >= STALL_STREAM_THRESHOLD
+                            && stall_duration >= STALL_KILL_TIMEOUT
+                        {
+                            tracing::warn!(
+                                "server connection stalled for {}s with {} streams — killing connection cnx={}",
+                                stall_duration.as_secs(),
+                                metrics.streams_total,
+                                cnx_id,
+                            );
+                            let state = unsafe { &mut *state_ptr };
+                            remove_connection_streams(state, cnx_id);
+                            unsafe { picoquic_delete_cnx(slot.cnx) };
+                            last_seen.remove(&cnx_id);
+                            stall_first_seen.remove(&cnx_id);
+                            continue;
+                        }
+
+                        if loop_time.saturating_sub(last_flow_block_log_at)
+                            >= FLOW_BLOCKED_LOG_INTERVAL_US
+                        {
+                            let flow_blocked = unsafe { slipstream_is_flow_blocked(slot.cnx) != 0 };
+                            let has_ready_stream =
+                                unsafe { slipstream_has_ready_stream(slot.cnx) != 0 };
+                            let send_backlog =
+                                unsafe { (&*state_ptr).stream_send_backlog_summaries(cnx_id, 8) };
+                            tracing::warn!(
+                                "server connection stalled: cnx={} streams={} streams_with_write_tx={} streams_with_data_rx={} queued_bytes_total={} streams_with_pending_data={} pending_chunks_total={} pending_bytes_total={} streams_with_pending_fin={} streams_with_fin_enqueued={} streams_with_target_fin_pending={} streams_with_send_pending={} streams_with_send_stash={} send_stash_bytes_total={} streams_discarding={} streams_close_after_flush={} multi_stream={} flow_blocked={} has_ready_stream={} send_backlog={:?}",
+                                cnx_id,
+                                metrics.streams_total,
+                                metrics.streams_with_write_tx,
+                                metrics.streams_with_data_rx,
+                                metrics.queued_bytes_total,
+                                metrics.streams_with_pending_data,
+                                metrics.pending_chunks_total,
+                                metrics.pending_bytes_total,
+                                metrics.streams_with_pending_fin,
+                                metrics.streams_with_fin_enqueued,
+                                metrics.streams_with_target_fin_pending,
+                                metrics.streams_with_send_pending,
+                                metrics.streams_with_send_stash,
+                                metrics.send_stash_bytes_total,
+                                metrics.streams_discarding,
+                                metrics.streams_close_after_flush,
+                                metrics.multi_stream,
+                                flow_blocked,
+                                has_ready_stream,
+                                send_backlog
+                            );
+                            last_flow_block_log_at = loop_time;
+                        }
+                    } else {
+                        // No longer stalled — clear the tracker.
+                        stall_first_seen.remove(&cnx_id);
                     }
                 }
             }
