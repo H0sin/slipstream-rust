@@ -21,8 +21,9 @@
 //! `MAX_CACHE_FAILURES` consecutive failures are evicted.
 
 use super::health::{probe_candidate, ProbeResult};
+use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
-use rand::thread_rng;
+use rand::{thread_rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use slipstream_ffi::ResolverMode;
 use std::collections::HashSet;
@@ -447,7 +448,7 @@ pub(crate) async fn run_resolver_scanner(
     };
 
     let mut round: u32 = 0;
-    let mut rng = thread_rng();
+    let mut rng = StdRng::from_entropy();
 
     loop {
         round = round.wrapping_add(1);
