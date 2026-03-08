@@ -586,7 +586,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                         // the QUIC path is obviously alive.
                         let now_us = unsafe { picoquic_current_time() };
                         let idle_us = now_us.saturating_sub(tunnel.last_activity_at);
-                        let grace_us = 60_000_000; // 60 s
+                        let grace_us = 15_000_000; // 15 s
                         if idle_us < grace_us {
                             debug!(
                                 "{}: health probe failed but tunnel active {}s ago — ignoring",

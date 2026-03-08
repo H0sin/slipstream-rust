@@ -85,8 +85,8 @@ struct Args {
     #[arg(long = "scan-file", value_name = "PATH")]
     scan_file: Option<String>,
 
-    /// Path to JSON cache file for persisting discovered resolvers [default: scan-cache.json]
-    #[arg(long = "scan-cache", value_name = "PATH", default_value = "scan-cache.json")]
+    /// Path to JSON cache file for persisting discovered resolvers
+    #[arg(long = "scan-cache", value_name = "PATH", default_value = "/etc/slipstream/scan-cache.json")]
     scan_cache: String,
 
     /// Interval between resolver scan rounds in seconds [default: 300]

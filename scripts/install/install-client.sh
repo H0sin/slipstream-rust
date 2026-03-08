@@ -91,7 +91,7 @@ if [[ "${1:-}" != "" ]]; then
       KEEP_ALIVE_INTERVAL="${KEEP_ALIVE_INTERVAL:-400}"
       GSO="${GSO:-}"
       SCAN_FILE="${SCAN_FILE:-}"
-      SCAN_CACHE="${SCAN_CACHE:-scan-cache.json}"
+      SCAN_CACHE="${SCAN_CACHE:-/etc/slipstream/scan-cache.json}"
       SCAN_INTERVAL="${SCAN_INTERVAL:-300}"
       SCAN_MAX="${SCAN_MAX:-5}"
       SCAN_BATCH="${SCAN_BATCH:-50}"
@@ -189,7 +189,7 @@ if [[ "${1:-}" != "" ]]; then
       [[ -n "$KEEP_ALIVE_INTERVAL" && "$KEEP_ALIVE_INTERVAL" != "400" ]] && EXTRA_ARGS="$EXTRA_ARGS --keep-alive-interval $KEEP_ALIVE_INTERVAL"
       [[ "$GSO" == "on" ]] && EXTRA_ARGS="$EXTRA_ARGS --gso"
       [[ -n "$SCAN_FILE" ]] && EXTRA_ARGS="$EXTRA_ARGS --scan-file $SCAN_FILE"
-      [[ -n "$SCAN_CACHE" && "$SCAN_CACHE" != "scan-cache.json" ]] && EXTRA_ARGS="$EXTRA_ARGS --scan-cache $SCAN_CACHE"
+      [[ -n "$SCAN_CACHE" ]] && EXTRA_ARGS="$EXTRA_ARGS --scan-cache $SCAN_CACHE"
       [[ -n "$SCAN_INTERVAL" && "$SCAN_INTERVAL" != "300" ]] && EXTRA_ARGS="$EXTRA_ARGS --scan-interval $SCAN_INTERVAL"
       [[ -n "$SCAN_MAX" && "$SCAN_MAX" != "5" ]] && EXTRA_ARGS="$EXTRA_ARGS --scan-max $SCAN_MAX"
       [[ -n "$SCAN_BATCH" && "$SCAN_BATCH" != "50" ]] && EXTRA_ARGS="$EXTRA_ARGS --scan-batch $SCAN_BATCH"
@@ -385,9 +385,9 @@ GSO="${GSO:-off}"
 ask "Scan ranges file path (leave empty to use built-in defaults)"
 read -r SCAN_FILE < /dev/tty
 
-ask "Scan cache file [default: scan-cache.json]"
+ask "Scan cache file [default: /etc/slipstream/scan-cache.json]"
 read -r SCAN_CACHE < /dev/tty
-SCAN_CACHE="${SCAN_CACHE:-scan-cache.json}"
+SCAN_CACHE="${SCAN_CACHE:-/etc/slipstream/scan-cache.json}"
 
 ask "Scan interval in seconds [default: 300]"
 read -r SCAN_INTERVAL < /dev/tty
@@ -411,7 +411,7 @@ EXTRA_ARGS=""
 [[ -n "$KEEP_ALIVE_INTERVAL" && "$KEEP_ALIVE_INTERVAL" != "400" ]] && EXTRA_ARGS="$EXTRA_ARGS --keep-alive-interval $KEEP_ALIVE_INTERVAL"
 [[ "$GSO" == "on" ]] && EXTRA_ARGS="$EXTRA_ARGS --gso"
 [[ -n "$SCAN_FILE" ]] && EXTRA_ARGS="$EXTRA_ARGS --scan-file $SCAN_FILE"
-[[ -n "$SCAN_CACHE" && "$SCAN_CACHE" != "scan-cache.json" ]] && EXTRA_ARGS="$EXTRA_ARGS --scan-cache $SCAN_CACHE"
+[[ -n "$SCAN_CACHE" ]] && EXTRA_ARGS="$EXTRA_ARGS --scan-cache $SCAN_CACHE"
 [[ -n "$SCAN_INTERVAL" && "$SCAN_INTERVAL" != "300" ]] && EXTRA_ARGS="$EXTRA_ARGS --scan-interval $SCAN_INTERVAL"
 [[ -n "$SCAN_MAX" && "$SCAN_MAX" != "5" ]] && EXTRA_ARGS="$EXTRA_ARGS --scan-max $SCAN_MAX"
 [[ -n "$SCAN_BATCH" && "$SCAN_BATCH" != "50" ]] && EXTRA_ARGS="$EXTRA_ARGS --scan-batch $SCAN_BATCH"

@@ -132,11 +132,11 @@ pub(crate) async fn probe_candidate(
 // ── Constants ───────────────────────────────────────────────────────
 
 /// How often we health-check all active tunnels.
-const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(15);
 
 /// A tunnel must fail this many consecutive health checks before
 /// we tell the pool to mark it unhealthy.
-const CONSECUTIVE_FAIL_THRESHOLD: u32 = 4;
+const CONSECUTIVE_FAIL_THRESHOLD: u32 = 2;
 
 /// Maximum number of tunnels we health-check in a single round.
 const MAX_CHECK_PER_ROUND: usize = 128;
