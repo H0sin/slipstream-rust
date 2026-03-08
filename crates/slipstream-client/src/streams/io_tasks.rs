@@ -36,7 +36,7 @@ pub(super) fn spawn_client_reader(
                             if data_tx.send(data).await.is_err() {
                                 break;
                             }
-                            data_notify.notify_one();
+                            data_notify.notify_waiters();
                         }
                         Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
                             continue;
@@ -53,7 +53,7 @@ pub(super) fn spawn_client_reader(
             }
         }
         drop(data_tx);
-        data_notify.notify_one();
+        data_notify.notify_waiters();
     });
 }
 

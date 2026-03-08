@@ -34,6 +34,16 @@ pub struct ClientConfig<'a> {
     pub keep_alive_interval: usize,
     pub debug_poll: bool,
     pub debug_streams: bool,
+    /// Path to file containing IP ranges for resolver scanning.
+    pub scan_file: Option<&'a str>,
+    /// Path to JSON cache file for persisting discovered resolvers.
+    pub scan_cache: Option<&'a str>,
+    /// Interval between scan rounds in seconds (0 = disabled).
+    pub scan_interval_secs: u64,
+    /// Maximum number of dynamically discovered resolvers.
+    pub scan_max_resolvers: usize,
+    /// IPs to probe per scan batch.
+    pub scan_batch_size: usize,
 }
 
 pub use runtime::{

@@ -61,7 +61,7 @@ fn build_tunnel_probe(domain: &str, id: u16) -> Result<Vec<u8>, String> {
 }
 
 /// Probe a single resolver+domain with a tunnel-encoded DNS query.
-async fn probe_candidate(
+pub(crate) async fn probe_candidate(
     addr: SocketAddr,
     domain: &str,
     id: u16,

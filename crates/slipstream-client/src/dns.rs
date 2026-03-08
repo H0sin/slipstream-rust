@@ -5,6 +5,7 @@ mod path;
 mod poll;
 pub(crate) mod resolver;
 mod response;
+pub(crate) mod scanner;
 
 pub(crate) use balancer::DomainBalancer;
 pub(crate) use debug::maybe_report_debug;
@@ -16,3 +17,4 @@ pub(crate) use resolver::{
     sockaddr_storage_to_socket_addr, ResolverState,
 };
 pub(crate) use response::{handle_dns_response_tunneled, TunneledResponseContext};
+pub(crate) use scanner::{run_resolver_scanner, DiscoveredResolver, ScannerConfig};

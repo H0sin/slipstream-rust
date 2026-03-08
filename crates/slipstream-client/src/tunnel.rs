@@ -45,6 +45,14 @@ pub(crate) struct TunnelRoute {
     pub(crate) healthy: bool,
     /// Timestamp of last successful network activity (picoquic µs).
     pub(crate) last_activity_at: u64,
+    /// Timestamp when flow_blocked was first observed (picoquic µs), 0 = not blocked.
+    pub(crate) flow_blocked_since: u64,
+    /// Cumulative rx_bytes snapshot for throughput stall detection.
+    pub(crate) stall_rx_snapshot: u64,
+    /// Cumulative tx_bytes snapshot for throughput stall detection.
+    pub(crate) stall_tx_snapshot: u64,
+    /// Timestamp of last throughput stall check (picoquic µs).
+    pub(crate) stall_check_at: u64,
 }
 
 // Safety: The raw pointers (`cnx`, `state_ptr`) are managed exclusively

@@ -10,7 +10,9 @@ use crate::dns::{
     expire_inflight_polls, handle_dns_response_tunneled, maybe_report_debug,
     refresh_resolver_path, resolve_resolvers, resolver_mode_to_c,
     send_poll_queries, sockaddr_storage_to_socket_addr,
-    DomainBalancer, HealthUpdate, TunnelSnapshot, TunneledResponseContext,
+    DomainBalancer, DiscoveredResolver, HealthUpdate, ScannerConfig,
+    TunnelSnapshot, TunneledResponseContext,
+    run_resolver_scanner,
 };
 use crate::error::ClientError;
 use crate::pacing::{cwnd_target_polls, inflight_packet_estimate};
@@ -37,7 +39,7 @@ use slipstream_ffi::{
     socket_addr_to_storage, take_crypto_errors, ClientConfig, QuicGuard, ResolverMode,
 };
 use std::ffi::CString;
-use std::net::Ipv6Addr;
+use std::net::{Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Notify};
@@ -52,10 +54,14 @@ const DNS_POLL_SLICE_US: u64 = 20_000;
 const RECONNECT_SLEEP_MIN_MS: u64 = 250;
 const RECONNECT_SLEEP_MAX_MS: u64 = 5_000;
 const FLOW_BLOCKED_LOG_INTERVAL_US: u64 = 1_000_000;
-const WATCHDOG_TIMEOUT_US: u64 = 60_000_000;
+const WATCHDOG_TIMEOUT_US: u64 = 20_000_000;
 /// Idle recursive tunnels send a keepalive poll every this many µs.
 const KEEPALIVE_POLL_INTERVAL_US: u64 = 10_000_000;
 const HEARTBEAT_INTERVAL_US: u64 = 60_000_000;
+/// If flow_blocked stays true for this long with active streams, mark unhealthy.
+const FLOW_BLOCKED_KILL_US: u64 = 10_000_000;
+/// Throughput stall: if streams exist but no bytes move for this long, mark unhealthy.
+const THROUGHPUT_STALL_US: u64 = 15_000_000;
 
 fn is_ipv6_unspecified(host: &str) -> bool {
     host.parse::<Ipv6Addr>()
@@ -156,6 +162,31 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
     drop(initial_resolvers);
     info!("Domain balancer created: {}", balancer.summary());
 
+    // Spawn background resolver scanner (if scan file is configured).
+    let (scanner_tx, mut scanner_rx) = mpsc::unbounded_channel::<DiscoveredResolver>();
+    if let Some(scan_file) = config.scan_file {
+        let cache_path = config
+            .scan_cache
+            .map(|s| std::path::PathBuf::from(s))
+            .unwrap_or_else(|| std::path::PathBuf::from("scan-cache.json"));
+        let scan_config = ScannerConfig {
+            ranges_file: std::path::PathBuf::from(scan_file),
+            cache_file: cache_path,
+            domains: config.domains.to_vec(),
+            interval: Duration::from_secs(config.scan_interval_secs),
+            max_discovered: config.scan_max_resolvers,
+            mode: ResolverMode::Recursive,
+            batch_size: config.scan_batch_size,
+        };
+        let tx = scanner_tx.clone();
+        tokio::spawn(async move {
+            run_resolver_scanner(scan_config, tx).await;
+        });
+    }
+
+    // Track dynamically discovered resolvers (persists across reconnects).
+    let mut discovered_resolvers: Vec<(SocketAddr, ResolverMode)> = Vec::new();
+
     let mut reconnect_count: u64 = 0;
 
     loop {
@@ -164,7 +195,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
             return Err(ClientError::new("At least one resolver is required"));
         }
 
-        balancer.resize_resolvers(base_resolvers.len());
+        balancer.resize_resolvers(base_resolvers.len() + discovered_resolvers.len());
         if reconnect_count > 0 {
             info!(
                 "Reconnect #{}: balancer state preserved — {}",
@@ -322,9 +353,114 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                     dns_id: 1,
                     healthy: true,
                     last_activity_at: current_time,
+                    flow_blocked_since: 0,
+                    stall_rx_snapshot: 0,
+                    stall_tx_snapshot: 0,
+                    stall_check_at: current_time,
                 });
                 _tunnel_states.push(tunnel_state);
             }
+        }
+
+        // ── Create tunnels for previously discovered resolvers ──────
+        for (disc_i, (disc_addr, disc_mode)) in discovered_resolvers.iter().enumerate() {
+            let ri = base_resolvers.len() + disc_i;
+            let disc_storage = socket_addr_to_storage(*disc_addr);
+            for (di, domain) in config.domains.iter().enumerate() {
+                let tunnel_id = pool.tunnels.len();
+                let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Command>();
+                let mut tunnel_state = Box::new(ClientState::new(
+                    cmd_tx,
+                    data_notify.clone(),
+                    debug_streams,
+                    acceptor.clone(),
+                ));
+                let tunnel_state_ptr: *mut ClientState = &mut *tunnel_state;
+
+                unsafe {
+                    slipstream_set_default_path_mode(resolver_mode_to_c(*disc_mode));
+                }
+
+                let mut server_storage = disc_storage;
+                let cnx = unsafe {
+                    picoquic_create_client_cnx(
+                        quic,
+                        &mut server_storage as *mut _ as *mut libc::sockaddr,
+                        current_time,
+                        0,
+                        sni.as_ptr(),
+                        alpn.as_ptr(),
+                        Some(client_callback),
+                        tunnel_state_ptr as *mut _,
+                    )
+                };
+                if cnx.is_null() {
+                    warn!(
+                        "Could not create QUIC connection for discovered tunnel[{}] (resolver={} domain={}); skipping",
+                        tunnel_id, disc_addr, domain
+                    );
+                    continue;
+                }
+
+                let mut resolver = crate::dns::resolver::ResolverState {
+                    addr: *disc_addr,
+                    storage: disc_storage,
+                    local_addr_storage: None,
+                    mode: *disc_mode,
+                    added: true,
+                    path_id: 0,
+                    unique_path_id: Some(0),
+                    probe_attempts: 0,
+                    next_probe_at: 0,
+                    pending_polls: 0,
+                    inflight_poll_ids: std::collections::HashMap::new(),
+                    pacing_budget: match disc_mode {
+                        ResolverMode::Authoritative => {
+                            Some(crate::pacing::PacingPollBudget::new(mtu))
+                        }
+                        ResolverMode::Recursive => None,
+                    },
+                    last_pacing_snapshot: None,
+                    debug: crate::dns::debug::DebugMetrics::new(config.debug_poll),
+                };
+
+                apply_path_mode(cnx, &mut resolver)?;
+
+                unsafe {
+                    picoquic_set_callback(cnx, Some(client_callback), tunnel_state_ptr as *mut _);
+                    picoquic_enable_path_callbacks(cnx, 1);
+                    if config.keep_alive_interval > 0 {
+                        picoquic_enable_keep_alive(cnx, config.keep_alive_interval as u64 * 1000);
+                    } else {
+                        picoquic_disable_keep_alive(cnx);
+                    }
+                }
+
+                pool.tunnels.push(TunnelRoute {
+                    id: tunnel_id,
+                    resolver_idx: ri,
+                    domain_idx: di,
+                    domain: domain.clone(),
+                    cnx,
+                    state_ptr: tunnel_state_ptr,
+                    command_rx: cmd_rx,
+                    resolver,
+                    dns_id: 1,
+                    healthy: true,
+                    last_activity_at: current_time,
+                    flow_blocked_since: 0,
+                    stall_rx_snapshot: 0,
+                    stall_tx_snapshot: 0,
+                    stall_check_at: current_time,
+                });
+                _tunnel_states.push(tunnel_state);
+            }
+        }
+        if !discovered_resolvers.is_empty() {
+            info!(
+                "Recreated {} discovered resolver tunnels on reconnect",
+                discovered_resolvers.len() * config.domains.len(),
+            );
         }
 
         if pool.tunnels.is_empty() {
@@ -341,8 +477,8 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
         let mut recv_buf = vec![0u8; 4096];
         let mut send_buf = vec![0u8; PICOQUIC_MAX_PACKET_SIZE];
         // Use per-tunnel burst limits; aggregate across all tunnels.
-        let packet_loop_send_max = pool.tunnels.len() * PICOQUIC_PACKET_LOOP_SEND_MAX * 2;
-        let packet_loop_recv_max = pool.tunnels.len() * PICOQUIC_PACKET_LOOP_RECV_MAX * 2;
+        let mut packet_loop_send_max = pool.tunnels.len() * PICOQUIC_PACKET_LOOP_SEND_MAX * 2;
+        let mut packet_loop_recv_max = pool.tunnels.len() * PICOQUIC_PACKET_LOOP_RECV_MAX * 2;
         let mut zero_send_loops = 0u64;
         let mut zero_send_with_streams = 0u64;
         let mut last_flow_block_log_at = 0u64;
@@ -463,6 +599,150 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                         balancer.suspend_resolver(tunnel.resolver_idx);
                     }
                 }
+            }
+
+            // ── Drain resolver scanner discoveries ───────────────────
+            while let Ok(discovered) = scanner_rx.try_recv() {
+                let addr = discovered.addr;
+
+                // Skip if already in pool (config or previously discovered).
+                if pool.tunnels.iter().any(|t| t.resolver.addr == addr) {
+                    debug!("[scanner] {} already in pool; skipping", addr);
+                    continue;
+                }
+                // Skip if it matches a config resolver.
+                if base_resolvers.iter().any(|r| r.addr == addr) {
+                    debug!("[scanner] {} is a config resolver; skipping", addr);
+                    continue;
+                }
+                // Respect the max-discovered limit.
+                if discovered_resolvers.len() >= config.scan_max_resolvers {
+                    debug!("[scanner] max discovered reached; ignoring {}", addr);
+                    continue;
+                }
+
+                info!(
+                    "[scanner] adding discovered resolver {} to pool (latency={}ms)",
+                    addr,
+                    discovered.latency.as_millis(),
+                );
+                discovered_resolvers.push((addr, discovered.mode));
+
+                let new_ri = balancer.add_resolver();
+                let disc_storage = socket_addr_to_storage(addr);
+
+                for (di, domain) in config.domains.iter().enumerate() {
+                    let tunnel_id = pool.tunnels.len();
+                    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Command>();
+                    let mut tunnel_state = Box::new(ClientState::new(
+                        cmd_tx,
+                        data_notify.clone(),
+                        debug_streams,
+                        acceptor.clone(),
+                    ));
+                    let tunnel_state_ptr: *mut ClientState = &mut *tunnel_state;
+
+                    unsafe {
+                        slipstream_set_default_path_mode(resolver_mode_to_c(discovered.mode));
+                    }
+
+                    let mut server_storage = disc_storage;
+                    let cnx = unsafe {
+                        picoquic_create_client_cnx(
+                            quic,
+                            &mut server_storage as *mut _ as *mut libc::sockaddr,
+                            current_time,
+                            0,
+                            sni.as_ptr(),
+                            alpn.as_ptr(),
+                            Some(client_callback),
+                            tunnel_state_ptr as *mut _,
+                        )
+                    };
+                    if cnx.is_null() {
+                        warn!(
+                            "[scanner] failed to create QUIC tunnel for {} domain={}; skipping",
+                            addr, domain,
+                        );
+                        // Keep state alive so the QUIC context can clean up safely.
+                        _tunnel_states.push(tunnel_state);
+                        continue;
+                    }
+
+                    let mut resolver = crate::dns::resolver::ResolverState {
+                        addr,
+                        storage: disc_storage,
+                        local_addr_storage: None,
+                        mode: discovered.mode,
+                        added: true,
+                        path_id: 0,
+                        unique_path_id: Some(0),
+                        probe_attempts: 0,
+                        next_probe_at: 0,
+                        pending_polls: 0,
+                        inflight_poll_ids: std::collections::HashMap::new(),
+                        pacing_budget: match discovered.mode {
+                            ResolverMode::Authoritative => {
+                                Some(crate::pacing::PacingPollBudget::new(mtu))
+                            }
+                            ResolverMode::Recursive => None,
+                        },
+                        last_pacing_snapshot: None,
+                        debug: crate::dns::debug::DebugMetrics::new(config.debug_poll),
+                    };
+
+                    if let Err(e) = apply_path_mode(cnx, &mut resolver) {
+                        warn!(
+                            "[scanner] apply_path_mode failed for {} domain={}: {}; skipping",
+                            addr, domain, e,
+                        );
+                        _tunnel_states.push(tunnel_state);
+                        continue;
+                    }
+
+                    unsafe {
+                        picoquic_set_callback(cnx, Some(client_callback), tunnel_state_ptr as *mut _);
+                        picoquic_enable_path_callbacks(cnx, 1);
+                        if config.keep_alive_interval > 0 {
+                            picoquic_enable_keep_alive(
+                                cnx,
+                                config.keep_alive_interval as u64 * 1000,
+                            );
+                        } else {
+                            picoquic_disable_keep_alive(cnx);
+                        }
+                    }
+
+                    pool.tunnels.push(TunnelRoute {
+                        id: tunnel_id,
+                        resolver_idx: new_ri,
+                        domain_idx: di,
+                        domain: domain.clone(),
+                        cnx,
+                        state_ptr: tunnel_state_ptr,
+                        command_rx: cmd_rx,
+                        resolver,
+                        dns_id: 1,
+                        healthy: true,
+                        last_activity_at: current_time,
+                        flow_blocked_since: 0,
+                        stall_rx_snapshot: 0,
+                        stall_tx_snapshot: 0,
+                        stall_check_at: current_time,
+                    });
+                    _tunnel_states.push(tunnel_state);
+                }
+
+                // Update burst limits for the expanded pool.
+                packet_loop_send_max = pool.tunnels.len() * PICOQUIC_PACKET_LOOP_SEND_MAX * 2;
+                packet_loop_recv_max = pool.tunnels.len() * PICOQUIC_PACKET_LOOP_RECV_MAX * 2;
+
+                info!(
+                    "[scanner] resolver {} added as resolver_idx={}, pool: {}",
+                    addr,
+                    new_ri,
+                    pool.summary(),
+                );
             }
 
             // ── Per-tunnel: expire inflight polls ────────────────────
@@ -735,23 +1015,48 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 }
             }
 
-            // ── Per-tunnel flow-blocked diagnostics ──────────────────
+            // ── Per-tunnel flow-blocked detection + auto-recovery ─────
             for tunnel in pool.tunnels.iter_mut() {
+                if !tunnel.healthy || tunnel.is_closing() {
+                    continue;
+                }
                 let has_ready_stream =
                     unsafe { slipstream_has_ready_stream(tunnel.cnx) != 0 };
                 let flow_blocked =
                     unsafe { slipstream_is_flow_blocked(tunnel.cnx) != 0 };
                 let streams_len = tunnel.streams_len();
+                let now = unsafe { picoquic_current_time() };
+
                 if streams_len > 0 && has_ready_stream && flow_blocked {
-                    let now = unsafe { picoquic_current_time() };
+                    // Track when flow_blocked first started.
+                    if tunnel.flow_blocked_since == 0 {
+                        tunnel.flow_blocked_since = now;
+                    }
+                    let blocked_dur = now.saturating_sub(tunnel.flow_blocked_since);
+
                     if now.saturating_sub(last_flow_block_log_at) >= FLOW_BLOCKED_LOG_INTERVAL_US {
                         error!(
-                            "{}: flow blocked, streams={}",
+                            "{}: flow blocked for {}s, streams={}",
                             tunnel.label(),
+                            blocked_dur / 1_000_000,
                             streams_len,
                         );
                         last_flow_block_log_at = now;
                     }
+
+                    // If stuck for too long, mark unhealthy so we reconnect.
+                    if blocked_dur >= FLOW_BLOCKED_KILL_US {
+                        warn!(
+                            "{}: flow blocked for {}s — marking unhealthy for reconnect",
+                            tunnel.label(),
+                            blocked_dur / 1_000_000,
+                        );
+                        tunnel.healthy = false;
+                        balancer.suspend_resolver(tunnel.resolver_idx);
+                    }
+                } else {
+                    // Clear the tracker when flow is unblocked.
+                    tunnel.flow_blocked_since = 0;
                 }
             }
 
@@ -912,8 +1217,48 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                         WATCHDOG_TIMEOUT_US / 1_000_000,
                     );
                     tunnel.healthy = false;
+                    balancer.suspend_resolver(tunnel.resolver_idx);
                 }
             }
+
+            // ── Per-tunnel throughput stall detection ─────────────────
+            // If a tunnel has active streams but no bytes are moving
+            // (send_bytes + dns_responses unchanged), it's stalled.
+            for tunnel in pool.tunnels.iter_mut() {
+                if !tunnel.healthy || tunnel.is_closing() {
+                    continue;
+                }
+                let streams_len = tunnel.streams_len();
+                if streams_len == 0 {
+                    // No streams → reset snapshot, nothing to stall on.
+                    tunnel.stall_rx_snapshot = tunnel.resolver.debug.dns_responses;
+                    tunnel.stall_tx_snapshot = tunnel.resolver.debug.send_bytes;
+                    tunnel.stall_check_at = now_wd;
+                    continue;
+                }
+                let cur_rx = tunnel.resolver.debug.dns_responses;
+                let cur_tx = tunnel.resolver.debug.send_bytes;
+                if cur_rx != tunnel.stall_rx_snapshot || cur_tx != tunnel.stall_tx_snapshot {
+                    // Progress — update snapshot.
+                    tunnel.stall_rx_snapshot = cur_rx;
+                    tunnel.stall_tx_snapshot = cur_tx;
+                    tunnel.stall_check_at = now_wd;
+                } else {
+                    // No progress — check how long.
+                    let stall_dur = now_wd.saturating_sub(tunnel.stall_check_at);
+                    if stall_dur >= THROUGHPUT_STALL_US {
+                        warn!(
+                            "{}: throughput stall for {}s with {} streams — marking unhealthy",
+                            tunnel.label(),
+                            stall_dur / 1_000_000,
+                            streams_len,
+                        );
+                        tunnel.healthy = false;
+                        balancer.suspend_resolver(tunnel.resolver_idx);
+                    }
+                }
+            }
+
             if pool.all_unhealthy() {
                 warn!("All tunnels unhealthy; forcing reconnect");
                 break 'inner;

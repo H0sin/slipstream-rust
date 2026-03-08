@@ -81,6 +81,26 @@ struct Args {
     #[arg(long = "debug-streams")]
     debug_streams: bool,
 
+    /// Path to file containing IP ranges for resolver scanning (one range per line: CIDR, dash-range, or single IP)
+    #[arg(long = "scan-file", value_name = "PATH")]
+    scan_file: Option<String>,
+
+    /// Path to JSON cache file for persisting discovered resolvers [default: scan-cache.json]
+    #[arg(long = "scan-cache", value_name = "PATH", default_value = "scan-cache.json")]
+    scan_cache: String,
+
+    /// Interval between resolver scan rounds in seconds [default: 300]
+    #[arg(long = "scan-interval", default_value_t = 300)]
+    scan_interval: u64,
+
+    /// Maximum number of resolvers to discover via scanning [default: 5]
+    #[arg(long = "scan-max", default_value_t = 5)]
+    scan_max: usize,
+
+    /// Number of IPs to probe per scan batch [default: 50]
+    #[arg(long = "scan-batch", default_value_t = 50)]
+    scan_batch: usize,
+
 }
 
 fn main() {
@@ -205,6 +225,11 @@ fn main() {
         keep_alive_interval: keep_alive_interval as usize,
         debug_poll: args.debug_poll,
         debug_streams: args.debug_streams,
+        scan_file: args.scan_file.as_deref(),
+        scan_cache: Some(args.scan_cache.as_str()),
+        scan_interval_secs: args.scan_interval,
+        scan_max_resolvers: args.scan_max,
+        scan_batch_size: args.scan_batch,
     };
 
     let runtime = Builder::new_current_thread()
