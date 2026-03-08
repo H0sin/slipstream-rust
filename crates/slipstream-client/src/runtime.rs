@@ -162,15 +162,21 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
     drop(initial_resolvers);
     info!("Domain balancer created: {}", balancer.summary());
 
-    // Spawn background resolver scanner (if scan file is configured).
+    // Spawn background resolver scanner.
+    // Uses the specified scan file if provided and exists, otherwise falls back
+    // to built-in default ranges embedded in the binary.
     let (scanner_tx, mut scanner_rx) = mpsc::unbounded_channel::<DiscoveredResolver>();
-    if let Some(scan_file) = config.scan_file {
+    {
+        let ranges_file = config
+            .scan_file
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default();
         let cache_path = config
             .scan_cache
             .map(|s| std::path::PathBuf::from(s))
             .unwrap_or_else(|| std::path::PathBuf::from("scan-cache.json"));
         let scan_config = ScannerConfig {
-            ranges_file: std::path::PathBuf::from(scan_file),
+            ranges_file,
             cache_file: cache_path,
             domains: config.domains.to_vec(),
             interval: Duration::from_secs(config.scan_interval_secs),

@@ -194,11 +194,11 @@ fn split_port_suffix(input: &str) -> (&str, u16) {
     (input, 53)
 }
 
-/// Load and parse all ranges from a file.
-pub(crate) fn load_ranges_from_file(path: &Path) -> Result<Vec<IpRange>, String> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| format!("failed to read range file '{}': {}", path.display(), e))?;
+/// Built-in default IP ranges (embedded at compile time from ranges.txt).
+const DEFAULT_RANGES: &str = include_str!("../../../../ranges.txt");
 
+/// Parse ranges from a string (one range per line).
+pub(crate) fn parse_ranges_from_str(content: &str, source: &str) -> Vec<IpRange> {
     let mut ranges = Vec::new();
     for (line_no, line) in content.lines().enumerate() {
         match parse_range_line(line) {
@@ -207,7 +207,7 @@ pub(crate) fn load_ranges_from_file(path: &Path) -> Result<Vec<IpRange>, String>
             Err(e) => {
                 warn!(
                     "[scanner] {}:{}: skipping bad line '{}': {}",
-                    path.display(),
+                    source,
                     line_no + 1,
                     line.trim(),
                     e,
@@ -215,7 +215,14 @@ pub(crate) fn load_ranges_from_file(path: &Path) -> Result<Vec<IpRange>, String>
             }
         }
     }
-    Ok(ranges)
+    ranges
+}
+
+/// Load and parse all ranges from a file.
+pub(crate) fn load_ranges_from_file(path: &Path) -> Result<Vec<IpRange>, String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("failed to read range file '{}': {}", path.display(), e))?;
+    Ok(parse_ranges_from_str(&content, &path.display().to_string()))
 }
 
 // ── JSON cache ──────────────────────────────────────────────────────
@@ -419,31 +426,42 @@ pub(crate) async fn run_resolver_scanner(
         }
     }
 
-    // ── Phase 2: load ranges ────────────────────────────────────
-    let ranges = match load_ranges_from_file(&config.ranges_file) {
-        Ok(r) if r.is_empty() => {
-            warn!(
-                "[scanner] range file {} is empty or has no valid ranges; scanner will only re-validate cache",
-                config.ranges_file.display(),
-            );
-            Vec::new()
-        }
-        Ok(r) => {
-            let total_ips: u64 = r.iter().map(|rg| rg.count()).sum();
-            info!(
-                "[scanner] loaded {} ranges ({} total IPs) from {}",
-                r.len(),
-                total_ips,
-                config.ranges_file.display(),
-            );
-            r
-        }
-        Err(e) => {
-            warn!(
-                "[scanner] failed to load ranges: {}; scanner will only re-validate cache",
-                e,
-            );
-            Vec::new()
+    // ── Phase 2: load ranges (file → embedded fallback) ─────────
+    let ranges = if config.ranges_file.as_os_str().is_empty() {
+        // No file specified at all; use embedded defaults.
+        let r = parse_ranges_from_str(DEFAULT_RANGES, "<built-in>");
+        info!("[scanner] using built-in default ranges ({} ranges)", r.len());
+        r
+    } else {
+        match load_ranges_from_file(&config.ranges_file) {
+            Ok(r) if r.is_empty() => {
+                warn!(
+                    "[scanner] range file {} is empty; falling back to built-in defaults",
+                    config.ranges_file.display(),
+                );
+                let r = parse_ranges_from_str(DEFAULT_RANGES, "<built-in>");
+                info!("[scanner] using built-in default ranges ({} ranges)", r.len());
+                r
+            }
+            Ok(r) => {
+                let total_ips: u64 = r.iter().map(|rg| rg.count()).sum();
+                info!(
+                    "[scanner] loaded {} ranges ({} total IPs) from {}",
+                    r.len(),
+                    total_ips,
+                    config.ranges_file.display(),
+                );
+                r
+            }
+            Err(e) => {
+                warn!(
+                    "[scanner] failed to load ranges: {}; falling back to built-in defaults",
+                    e,
+                );
+                let r = parse_ranges_from_str(DEFAULT_RANGES, "<built-in>");
+                info!("[scanner] using built-in default ranges ({} ranges)", r.len());
+                r
+            }
         }
     };
 

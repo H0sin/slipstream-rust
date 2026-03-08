@@ -81,7 +81,7 @@ struct Args {
     #[arg(long = "debug-streams")]
     debug_streams: bool,
 
-    /// Path to file containing IP ranges for resolver scanning (one range per line: CIDR, dash-range, or single IP)
+    /// Path to file containing IP ranges for resolver scanning; if omitted or file not found, uses built-in defaults
     #[arg(long = "scan-file", value_name = "PATH")]
     scan_file: Option<String>,
 
