@@ -8,6 +8,7 @@ use slipstream_core::flow_control::{
     promote_error_log_message, promote_streams, FlowControlState, HasFlowControlState,
     PromoteEntry, StreamReceiveConfig, StreamReceiveOps,
 };
+use std::sync::OnceLock;
 use slipstream_core::invariants::InvariantReporter;
 #[cfg(test)]
 use slipstream_core::test_support::FailureCounter;
@@ -123,6 +124,19 @@ impl HasFlowControlState for ServerStream {
     fn flow_control_mut(&mut self) -> &mut FlowControlState {
         &mut self.flow
     }
+}
+
+const DEFAULT_MAX_STREAMS_PER_CONNECTION: usize = 200;
+
+fn max_streams_per_connection() -> usize {
+    static MAX: OnceLock<usize> = OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("SLIPSTREAM_MAX_STREAMS_PER_CONNECTION")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_MAX_STREAMS_PER_CONNECTION)
+    })
 }
 
 fn mark_multi_stream(state: &mut ServerState, cnx_id: usize) -> bool {
@@ -379,6 +393,17 @@ fn handle_stream_data(
     let mut remove_stream = false;
 
     if !state.streams.contains_key(&key) {
+        // Enforce per-connection stream cap to prevent resource exhaustion.
+        let cnx_stream_count = state.streams.keys().filter(|k| k.cnx == key.cnx).count();
+        let max_streams = max_streams_per_connection();
+        if cnx_stream_count >= max_streams {
+            warn!(
+                "stream {:?}: rejecting new stream — connection has {} streams (limit={})",
+                key.stream_id, cnx_stream_count, max_streams
+            );
+            unsafe { abort_stream_bidi(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR) };
+            return;
+        }
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         if debug_streams {
             debug!("stream {:?}: connecting", key.stream_id);

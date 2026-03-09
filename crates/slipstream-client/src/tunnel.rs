@@ -10,7 +10,21 @@
 use crate::dns::resolver::ResolverState;
 use crate::streams::{ClientState, Command};
 use slipstream_ffi::picoquic::picoquic_cnx_t;
+use std::sync::OnceLock;
 use tokio::sync::mpsc;
+
+const DEFAULT_MAX_STREAMS_PER_TUNNEL: usize = 200;
+
+fn max_streams_per_tunnel() -> usize {
+    static MAX: OnceLock<usize> = OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("SLIPSTREAM_MAX_STREAMS_PER_TUNNEL")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_MAX_STREAMS_PER_TUNNEL)
+    })
+}
 
 // ── TunnelRoute ─────────────────────────────────────────────────────
 
@@ -116,6 +130,8 @@ impl TunnelPool {
             return None;
         }
 
+        let stream_limit = max_streams_per_tunnel();
+
         // Round-robin across healthy + ready tunnels.
         let mut best: Option<(usize, usize)> = None; // (index, stream_count)
         for offset in 0..n {
@@ -123,6 +139,9 @@ impl TunnelPool {
             let t = &self.tunnels[i];
             if t.is_ready() && t.healthy {
                 let count = t.streams_len();
+                if count >= stream_limit {
+                    continue;
+                }
                 if best.is_none() || count < best.unwrap().1 {
                     best = Some((i, count));
                 }
@@ -133,10 +152,11 @@ impl TunnelPool {
             return Some(idx);
         }
 
-        // Fall back to any ready tunnel.
+        // Fall back to any ready tunnel (even unhealthy) below the limit.
         for offset in 0..n {
             let i = (self.rr_cursor + offset) % n;
-            if self.tunnels[i].is_ready() {
+            let t = &self.tunnels[i];
+            if t.is_ready() && t.streams_len() < stream_limit {
                 self.rr_cursor = (i + 1) % n;
                 return Some(i);
             }

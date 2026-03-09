@@ -44,7 +44,7 @@ pub(crate) const DEFAULT_TCP_RCVBUF_BYTES: usize = 256 * 1024;
 pub(crate) const TARGET_WRITE_COALESCE_DEFAULT_BYTES: usize = 256 * 1024;
 const FLOW_BLOCKED_LOG_INTERVAL_US: u64 = 1_000_000;
 /// If a connection has a send backlog for this long, kill it.
-const STALL_KILL_TIMEOUT: Duration = Duration::from_secs(30);
+const STALL_KILL_TIMEOUT: Duration = Duration::from_secs(15);
 /// Stream count threshold to consider a connection stalled.
 const STALL_STREAM_THRESHOLD: usize = 100;
 
