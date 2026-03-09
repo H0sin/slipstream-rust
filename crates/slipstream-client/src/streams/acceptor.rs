@@ -44,6 +44,11 @@ impl ClientAcceptor {
         self.limiter.reset();
     }
 
+    /// Release one stream credit after a committed stream closes.
+    pub(crate) fn release(&self) {
+        self.limiter.decrement_used_and_notify();
+    }
+
     #[cfg(test)]
     pub(crate) fn set_test_limit(limit: usize) {
         TEST_ACCEPTOR_LIMIT.store(limit, Ordering::SeqCst);

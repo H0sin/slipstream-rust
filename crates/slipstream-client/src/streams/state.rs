@@ -119,6 +119,15 @@ impl ClientState {
         self.streams.len()
     }
 
+    /// Remove a stream from the map and release its acceptor credit.
+    pub(super) fn remove_stream(&mut self, stream_id: &u64) -> Option<ClientStream> {
+        let removed = self.streams.remove(stream_id);
+        if removed.is_some() {
+            self.acceptor.release();
+        }
+        removed
+    }
+
     pub(crate) fn update_acceptor_limit(&mut self, cnx: *mut picoquic_cnx_t) {
         let max_streams = self.acceptor.update_limit(cnx);
         if !self.acceptor_limit_logged && max_streams > 0 {
