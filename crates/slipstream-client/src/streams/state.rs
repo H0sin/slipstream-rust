@@ -120,10 +120,15 @@ impl ClientState {
     }
 
     /// Remove a stream from the map and release its acceptor credit.
+    /// When the stream count drops to ≤1, demote from multi-stream mode
+    /// so the remaining stream regains the 64KB reserve buffer.
     pub(super) fn remove_stream(&mut self, stream_id: &u64) -> Option<ClientStream> {
         let removed = self.streams.remove(stream_id);
         if removed.is_some() {
             self.acceptor.release();
+            if self.multi_stream_mode && self.streams.len() <= 1 {
+                self.multi_stream_mode = false;
+            }
         }
         removed
     }

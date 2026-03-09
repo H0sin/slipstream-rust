@@ -584,6 +584,14 @@ pub(crate) fn remove_connection_streams(state: &mut ServerState, cnx: usize) {
 fn shutdown_stream(state: &mut ServerState, key: StreamKey) -> Option<ServerStream> {
     if let Some(stream) = state.streams.remove(&key) {
         let _ = stream.shutdown_tx.send(true);
+        // Demote from multi-stream mode when this connection drops to ≤1 streams,
+        // so the remaining stream regains the reserve buffer for flow control.
+        if state.multi_streams.contains(&key.cnx) {
+            let remaining = state.streams.keys().filter(|k| k.cnx == key.cnx).count();
+            if remaining <= 1 {
+                state.multi_streams.remove(&key.cnx);
+            }
+        }
         return Some(stream);
     }
     None
