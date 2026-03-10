@@ -66,7 +66,7 @@ const FLOW_BLOCKED_KILL_US: u64 = 10_000_000;
 const THROUGHPUT_STALL_US: u64 = 15_000_000;
 /// Hard upper bound on the send loop to prevent CPU spinning when the pool
 /// grows large (many discovered resolvers × domains).
-const PACKET_LOOP_SEND_CAP: usize = 200;
+const PACKET_LOOP_SEND_CAP: usize = 64;
 
 fn is_ipv6_unspecified(host: &str) -> bool {
     host.parse::<Ipv6Addr>()
@@ -636,19 +636,19 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
 
             // ── Throttle: prevent busy-spin when data_notify fires ───
             // data_notify can wake the loop every time a TCP read
-            // completes, bypassing the sleep timeout entirely.  When
-            // the link is degraded the loop would spin at 100% CPU
-            // doing expensive send + poll work that makes no progress.
-            // Enforce a minimum gap between heavy-work iterations.
-            // When heavy work already exceeded the gap, still yield
-            // briefly so the loop never pins a core at 100%.
+            // completes, bypassing the sleep timeout entirely.  Use
+            // the same computed timeout_us here so the escalation
+            // logic (consecutive_zero_delay → 20ms) still takes
+            // effect even when data_notify won the select.
             {
                 let elapsed = last_heavy_work_at.elapsed();
-                let min_gap = Duration::from_micros(MIN_POLL_INTERVAL_US);
+                let min_gap = Duration::from_micros(timeout_us.max(MIN_POLL_INTERVAL_US));
                 if elapsed < min_gap {
                     sleep(min_gap - elapsed).await;
                 } else {
-                    sleep(Duration::from_micros(200)).await;
+                    // Heavy work already exceeded the gap — still yield
+                    // so the loop never pins a core at 100%.
+                    sleep(Duration::from_micros(MIN_POLL_INTERVAL_US)).await;
                 }
                 last_heavy_work_at = std::time::Instant::now();
             }
