@@ -382,6 +382,14 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
             );
         }
 
+        // Prune stall_first_seen for entries older than 2× the kill timeout.
+        // This prevents the HashMap from growing unboundedly over hours when
+        // connections disappear without triggering normal cleanup paths.
+        if !stall_first_seen.is_empty() {
+            let prune_age = STALL_KILL_TIMEOUT * 2;
+            stall_first_seen.retain(|_, first_seen| now.duration_since(*first_seen) < prune_age);
+        }
+
         drain_commands(state_ptr, &mut command_rx);
         maybe_report_command_stats(state_ptr);
 
@@ -419,10 +427,14 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
 
                 if send_length == 0 {
                     let cnx_id = slot.cnx as usize;
-                    let metrics = unsafe { (&*state_ptr).stream_debug_metrics(cnx_id) };
-                    if metrics.streams_total > 0
-                        && metrics.has_send_backlog()
-                    {
+                    // Fast O(1) pre-check: skip the expensive metrics scan when the
+                    // connection has no streams at all.
+                    let quick_count = unsafe { (&*state_ptr).cnx_stream_count(cnx_id) };
+                    if quick_count > 0 {
+                        let metrics = unsafe { (&*state_ptr).stream_debug_metrics(cnx_id) };
+                        if metrics.streams_total > 0
+                            && metrics.has_send_backlog()
+                        {
                         // Track how long this connection has been stalled.
                         let stall_start = *stall_first_seen
                             .entry(cnx_id)
@@ -483,6 +495,7 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
                         // No longer stalled — clear the tracker.
                         stall_first_seen.remove(&cnx_id);
                     }
+                    } // quick_count > 0
                 }
             }
 

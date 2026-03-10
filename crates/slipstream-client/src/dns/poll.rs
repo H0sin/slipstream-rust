@@ -99,6 +99,7 @@ pub(crate) async fn send_poll_queries(
             Ok(q) => q,
             Err(err) => {
                 warn!("Failed to build poll qname: {err}; skipping packet");
+                tokio::task::yield_now().await;
                 continue;
             }
         };
@@ -117,6 +118,7 @@ pub(crate) async fn send_poll_queries(
             Ok(p) => p,
             Err(err) => {
                 warn!("Failed to encode poll query: {err}; skipping packet");
+                tokio::task::yield_now().await;
                 continue;
             }
         };
@@ -125,6 +127,7 @@ pub(crate) async fn send_poll_queries(
             Ok(d) => normalize_dual_stack_addr(d),
             Err(err) => {
                 warn!("Failed to parse poll dest address: {err}; skipping packet");
+                tokio::task::yield_now().await;
                 continue;
             }
         };

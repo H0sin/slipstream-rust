@@ -62,6 +62,9 @@ const HEARTBEAT_INTERVAL_US: u64 = 60_000_000;
 const FLOW_BLOCKED_KILL_US: u64 = 10_000_000;
 /// Throughput stall: if streams exist but no bytes move for this long, mark unhealthy.
 const THROUGHPUT_STALL_US: u64 = 15_000_000;
+/// Hard upper bound on the send loop to prevent CPU spinning when the pool
+/// grows large (many discovered resolvers × domains).
+const PACKET_LOOP_SEND_CAP: usize = 200;
 
 fn is_ipv6_unspecified(host: &str) -> bool {
     host.parse::<Ipv6Addr>()
@@ -483,7 +486,8 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
         let mut recv_buf = vec![0u8; 4096];
         let mut send_buf = vec![0u8; PICOQUIC_MAX_PACKET_SIZE];
         // Use per-tunnel burst limits; aggregate across all tunnels.
-        let mut packet_loop_send_max = pool.tunnels.len() * PICOQUIC_PACKET_LOOP_SEND_MAX * 2;
+        let mut packet_loop_send_max =
+            (pool.tunnels.len() * PICOQUIC_PACKET_LOOP_SEND_MAX * 2).min(PACKET_LOOP_SEND_CAP);
         let mut packet_loop_recv_max = pool.tunnels.len() * PICOQUIC_PACKET_LOOP_RECV_MAX * 2;
         let mut zero_send_loops = 0u64;
         let mut zero_send_with_streams = 0u64;
@@ -740,7 +744,8 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 }
 
                 // Update burst limits for the expanded pool.
-                packet_loop_send_max = pool.tunnels.len() * PICOQUIC_PACKET_LOOP_SEND_MAX * 2;
+                packet_loop_send_max =
+                    (pool.tunnels.len() * PICOQUIC_PACKET_LOOP_SEND_MAX * 2).min(PACKET_LOOP_SEND_CAP);
                 packet_loop_recv_max = pool.tunnels.len() * PICOQUIC_PACKET_LOOP_RECV_MAX * 2;
 
                 info!(
@@ -984,6 +989,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                     Ok(q) => q,
                     Err(err) => {
                         warn!("Failed to build DNS query name: {err}; skipping packet");
+                        tokio::task::yield_now().await;
                         continue 'send;
                     }
                 };
@@ -1001,6 +1007,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                     Ok(p) => p,
                     Err(err) => {
                         warn!("Failed to encode DNS query: {err}; skipping packet");
+                        tokio::task::yield_now().await;
                         continue 'send;
                     }
                 };
@@ -1009,6 +1016,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                     Ok(d) => normalize_dual_stack_addr(d),
                     Err(err) => {
                         warn!("Failed to parse dest address: {err}; skipping packet");
+                        tokio::task::yield_now().await;
                         continue 'send;
                     }
                 };
