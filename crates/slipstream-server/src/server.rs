@@ -427,6 +427,14 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
 
                 if send_length == 0 {
                     let cnx_id = slot.cnx as usize;
+                    // O(1) pre-check: skip expensive per-stream metrics when
+                    // this connection has no streams at all.
+                    let cnx_count = unsafe {
+                        (&*state_ptr).cnx_stream_counts.get(&cnx_id).copied().unwrap_or(0)
+                    };
+                    if cnx_count == 0 {
+                        stall_first_seen.remove(&cnx_id);
+                    } else {
                     let metrics = unsafe { (&*state_ptr).stream_debug_metrics(cnx_id) };
                     if metrics.streams_total > 0
                         && metrics.has_send_backlog()
@@ -491,6 +499,7 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
                         // No longer stalled — clear the tracker.
                         stall_first_seen.remove(&cnx_id);
                     }
+                    } // end cnx_count > 0
                 }
             }
 

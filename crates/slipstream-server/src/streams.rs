@@ -39,6 +39,8 @@ pub(crate) struct ServerState {
     target_addr: SocketAddr,
     streams: HashMap<StreamKey, ServerStream>,
     multi_streams: HashSet<usize>,
+    /// O(1) per-connection stream count; avoids scanning all keys.
+    pub(crate) cnx_stream_counts: HashMap<usize, usize>,
     command_tx: mpsc::UnboundedSender<Command>,
     debug_streams: bool,
     debug_commands: bool,
@@ -60,6 +62,7 @@ impl ServerState {
             target_addr,
             streams: HashMap::new(),
             multi_streams: HashSet::new(),
+            cnx_stream_counts: HashMap::new(),
             command_tx,
             debug_streams,
             debug_commands,
@@ -143,7 +146,7 @@ fn mark_multi_stream(state: &mut ServerState, cnx_id: usize) -> bool {
     if state.multi_streams.contains(&cnx_id) {
         return false;
     }
-    let count = state.streams.keys().filter(|key| key.cnx == cnx_id).count();
+    let count = state.cnx_stream_counts.get(&cnx_id).copied().unwrap_or(0);
     if count > 1 {
         state.multi_streams.insert(cnx_id);
         true
@@ -394,7 +397,7 @@ fn handle_stream_data(
 
     if !state.streams.contains_key(&key) {
         // Enforce per-connection stream cap to prevent resource exhaustion.
-        let cnx_stream_count = state.streams.keys().filter(|k| k.cnx == key.cnx).count();
+        let cnx_stream_count = state.cnx_stream_counts.get(&key.cnx).copied().unwrap_or(0);
         let max_streams = max_streams_per_connection();
         if cnx_stream_count >= max_streams {
             warn!(
@@ -432,6 +435,7 @@ fn handle_stream_data(
                 flow: FlowControlState::default(),
             },
         );
+        *state.cnx_stream_counts.entry(key.cnx).or_insert(0) += 1;
     }
 
     if mark_multi_stream(state, key.cnx) {
@@ -579,15 +583,23 @@ pub(crate) fn remove_connection_streams(state: &mut ServerState, cnx: usize) {
         shutdown_stream(state, key);
     }
     state.multi_streams.remove(&cnx);
+    state.cnx_stream_counts.remove(&cnx);
 }
 
 fn shutdown_stream(state: &mut ServerState, key: StreamKey) -> Option<ServerStream> {
     if let Some(stream) = state.streams.remove(&key) {
         let _ = stream.shutdown_tx.send(true);
+        // Decrement per-connection stream counter.
+        if let Some(count) = state.cnx_stream_counts.get_mut(&key.cnx) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                state.cnx_stream_counts.remove(&key.cnx);
+            }
+        }
         // Demote from multi-stream mode when this connection drops to ≤1 streams,
         // so the remaining stream regains the reserve buffer for flow control.
         if state.multi_streams.contains(&key.cnx) {
-            let remaining = state.streams.keys().filter(|k| k.cnx == key.cnx).count();
+            let remaining = state.cnx_stream_counts.get(&key.cnx).copied().unwrap_or(0);
             if remaining <= 1 {
                 state.multi_streams.remove(&key.cnx);
             }
@@ -607,6 +619,7 @@ pub(crate) fn handle_shutdown(quic: *mut picoquic_quic_t, state: &mut ServerStat
     }
     state.streams.clear();
     state.multi_streams.clear();
+    state.cnx_stream_counts.clear();
     true
 }
 

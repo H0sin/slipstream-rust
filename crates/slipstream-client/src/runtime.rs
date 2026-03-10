@@ -66,7 +66,11 @@ const FLOW_BLOCKED_KILL_US: u64 = 10_000_000;
 const THROUGHPUT_STALL_US: u64 = 15_000_000;
 /// Hard upper bound on the send loop to prevent CPU spinning when the pool
 /// grows large (many discovered resolvers × domains).
-const PACKET_LOOP_SEND_CAP: usize = 64;
+const PACKET_LOOP_SEND_CAP: usize = 200;
+/// Number of consecutive zero-send iterations (no packets produced) before
+/// applying an escalated sleep.  Only counts iterations where picoquic
+/// returned a short wake delay AND the send loop produced zero bytes.
+const ZERO_SEND_ESCALATION_THRESHOLD: u32 = 50;
 
 fn is_ipv6_unspecified(host: &str) -> bool {
     host.parse::<Ipv6Addr>()
@@ -362,10 +366,11 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
         let mut zero_send_loops = 0u64;
         let mut zero_send_with_streams = 0u64;
         let mut last_flow_block_log_at = 0u64;
-        // Counts consecutive iterations where picoquic returned a zero or
-        // near-zero wake delay.  Used to apply escalating back-off so the
-        // event loop doesn't busy-spin at 100% CPU.
-        let mut consecutive_zero_delay: u32 = 0;
+        // Counts consecutive iterations where picoquic returned a short
+        // wake delay AND the send loop produced no packets (true spinning).
+        // Only escalates when no productive work happened.
+        let mut consecutive_idle_spins: u32 = 0;
+        let mut sent_this_iteration: usize = 0;
         let _last_activity_at = unsafe { picoquic_current_time() };
         let mut last_heartbeat_at = unsafe { picoquic_current_time() };
         let mut last_health_snapshot_at = std::time::Instant::now();
@@ -533,22 +538,25 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 // Enforce a floor so that a zero wake-delay from picoquic
                 // (e.g. during retransmit / ack bursts on a degraded link)
                 // does not collapse the event loop into a 1 µs busy-spin.
-                let floor = if delay_us < MIN_POLL_INTERVAL_US {
-                    consecutive_zero_delay = consecutive_zero_delay.saturating_add(1);
-                    // Escalate: after 50 consecutive tight iterations, widen
-                    // the floor up to DNS_POLL_SLICE_US so the CPU can cool.
-                    if consecutive_zero_delay > 50 {
+                //
+                // **Only escalate when the loop is truly idle**: if the last
+                // send phase actually produced packets, the link is making
+                // progress and we should NOT sleep longer.
+                if delay_us < MIN_POLL_INTERVAL_US && sent_this_iteration == 0 {
+                    consecutive_idle_spins = consecutive_idle_spins.saturating_add(1);
+                    if consecutive_idle_spins > ZERO_SEND_ESCALATION_THRESHOLD {
                         DNS_POLL_SLICE_US
                     } else {
                         MIN_POLL_INTERVAL_US
                     }
                 } else {
-                    consecutive_zero_delay = 0;
-                    delay_us
-                };
-                floor.clamp(MIN_POLL_INTERVAL_US, DNS_POLL_SLICE_US)
+                    // Either picoquic gave a reasonable delay, or we sent
+                    // packets — reset the idle counter.
+                    consecutive_idle_spins = 0;
+                    delay_us.clamp(MIN_POLL_INTERVAL_US, DNS_POLL_SLICE_US)
+                }
             } else {
-                consecutive_zero_delay = 0;
+                consecutive_idle_spins = 0;
                 delay_us.max(MIN_POLL_INTERVAL_US)
             };
             let timeout = Duration::from_micros(timeout_us);
@@ -639,17 +647,18 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 _ = sleep(timeout) => {}
             }
 
-            // ── Throttle: enforce minimum gap between iterations ─────
-            // Guard against UDP recv or accept_rx winning select
-            // faster than the computed timeout.
-            {
+            // ── Throttle: enforce minimum gap only when idle ─────────
+            // Guard against rapid select wake-ups when no productive
+            // work is happening.  Skip throttle when we actually sent
+            // packets last iteration so throughput is not penalised.
+            if sent_this_iteration == 0 {
                 let elapsed = last_heavy_work_at.elapsed();
                 let min_gap = Duration::from_micros(MIN_POLL_INTERVAL_US);
                 if elapsed < min_gap {
                     sleep(min_gap - elapsed).await;
                 }
-                last_heavy_work_at = std::time::Instant::now();
             }
+            last_heavy_work_at = std::time::Instant::now();
 
             // ── Post-select: drain all tunnels ───────────────────────
             // If every tunnel is already closing/unhealthy, skip the
@@ -685,6 +694,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
             // ── Send phase: prepare packets from shared QUIC context ─
             // picoquic_prepare_next_packet_ex returns which cnx it
             // prepared for — we map that to a tunnel for DNS encoding.
+            sent_this_iteration = 0;
             'send: for _ in 0..packet_loop_send_max {
                 let current_time = unsafe { picoquic_current_time() };
                 let mut send_length: libc::size_t = 0;
@@ -805,6 +815,8 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                         warn!("Non-transient UDP send error: {err}; will reconnect");
                         break 'inner;
                     }
+                } else {
+                    sent_this_iteration += 1;
                 }
             }
 
