@@ -640,11 +640,15 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
             // the link is degraded the loop would spin at 100% CPU
             // doing expensive send + poll work that makes no progress.
             // Enforce a minimum gap between heavy-work iterations.
+            // When heavy work already exceeded the gap, still yield
+            // briefly so the loop never pins a core at 100%.
             {
                 let elapsed = last_heavy_work_at.elapsed();
                 let min_gap = Duration::from_micros(MIN_POLL_INTERVAL_US);
                 if elapsed < min_gap {
                     sleep(min_gap - elapsed).await;
+                } else {
+                    sleep(Duration::from_micros(200)).await;
                 }
                 last_heavy_work_at = std::time::Instant::now();
             }
