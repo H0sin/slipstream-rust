@@ -415,7 +415,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 if tunnel.is_closing() && tunnel.healthy {
                     warn!("{}: connection closed — marking unhealthy", tunnel.label());
                     tunnel.healthy = false;
-                    balancer.suspend_resolver(tunnel.resolver_idx);
+                    balancer.suspend_route(tunnel.resolver_idx, tunnel.domain_idx);
                 }
             }
 
@@ -478,10 +478,10 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                     tunnel.healthy = update.healthy;
                     if update.healthy && !was_healthy {
                         info!("{}: recovered", tunnel.label());
-                        balancer.unsuspend_resolver(tunnel.resolver_idx);
+                        balancer.unsuspend_route(tunnel.resolver_idx, tunnel.domain_idx);
                     } else if !update.healthy && was_healthy {
                         warn!("{}: marked unhealthy", tunnel.label());
-                        balancer.suspend_resolver(tunnel.resolver_idx);
+                        balancer.suspend_route(tunnel.resolver_idx, tunnel.domain_idx);
                     }
                 }
             }
@@ -843,7 +843,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                             blocked_dur / 1_000_000,
                         );
                         tunnel.healthy = false;
-                        balancer.suspend_resolver(tunnel.resolver_idx);
+                        balancer.suspend_route(tunnel.resolver_idx, tunnel.domain_idx);
                     }
                 } else {
                     // Clear the tracker when flow is unblocked.
@@ -1008,7 +1008,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                         WATCHDOG_TIMEOUT_US / 1_000_000,
                     );
                     tunnel.healthy = false;
-                    balancer.suspend_resolver(tunnel.resolver_idx);
+                    balancer.suspend_route(tunnel.resolver_idx, tunnel.domain_idx);
                 }
             }
 
@@ -1045,7 +1045,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                             streams_len,
                         );
                         tunnel.healthy = false;
-                        balancer.suspend_resolver(tunnel.resolver_idx);
+                        balancer.suspend_route(tunnel.resolver_idx, tunnel.domain_idx);
                     }
                 }
             }

@@ -420,8 +420,38 @@ impl DomainBalancer {
         })
     }
 
-    /// Suspend all routes for a resolver (health-check failed).
-    /// Uses `record_failure` repeatedly to push past the failure threshold.
+    /// Suspend a single (resolver, domain) route.
+    pub(crate) fn suspend_route(&mut self, resolver_idx: usize, domain_idx: usize) {
+        if let Some(route) = self.route_mut(resolver_idx, domain_idx) {
+            if route.healthy {
+                for _ in 0..FAILURE_THRESHOLD + 1 {
+                    route.record_failure();
+                }
+                tracing::warn!(
+                    "[health] route ({}, {}) suspended",
+                    resolver_idx,
+                    domain_idx,
+                );
+            }
+        }
+    }
+
+    /// Unsuspend / recover a single (resolver, domain) route.
+    pub(crate) fn unsuspend_route(&mut self, resolver_idx: usize, domain_idx: usize) {
+        if let Some(route) = self.route_mut(resolver_idx, domain_idx) {
+            if !route.healthy {
+                route.record_success(None, 0);
+                tracing::info!(
+                    "[health] route ({}, {}) recovered",
+                    resolver_idx,
+                    domain_idx,
+                );
+            }
+        }
+    }
+
+    /// Suspend all routes for a resolver (transport-level failure, e.g.
+    /// QUIC path lost).  Only used when the entire network path is gone.
     pub(crate) fn suspend_resolver(&mut self, resolver_idx: usize) {
         let num_domains = self.domains.len();
         let base = resolver_idx * num_domains;
@@ -429,8 +459,6 @@ impl DomainBalancer {
         for d in 0..num_domains {
             if let Some(route) = self.routes.get_mut(base + d) {
                 if route.healthy {
-                    // Push consecutive failures past threshold to trigger
-                    // the unhealthy transition.
                     for _ in 0..FAILURE_THRESHOLD + 1 {
                         route.record_failure();
                     }
@@ -447,8 +475,8 @@ impl DomainBalancer {
         }
     }
 
-    /// Unsuspend / recover all routes for a resolver whose health-check
-    /// passed again.
+    /// Unsuspend / recover all routes for a resolver (transport-level
+    /// recovery, e.g. QUIC path restored).
     pub(crate) fn unsuspend_resolver(&mut self, resolver_idx: usize) {
         let num_domains = self.domains.len();
         let base = resolver_idx * num_domains;
