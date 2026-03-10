@@ -40,8 +40,14 @@ pub(crate) fn drain_commands(
     state_ptr: *mut ClientState,
     command_rx: &mut mpsc::UnboundedReceiver<Command>,
 ) {
-    while let Ok(command) = command_rx.try_recv() {
-        handle_command(cnx, state_ptr, command);
+    // Cap to avoid spending the whole tick in command dispatch when a
+    // burst of stream events arrives (e.g. many simultaneous TCP closes).
+    const DRAIN_CAP: usize = 512;
+    for _ in 0..DRAIN_CAP {
+        match command_rx.try_recv() {
+            Ok(command) => handle_command(cnx, state_ptr, command),
+            Err(_) => break,
+        }
     }
 }
 

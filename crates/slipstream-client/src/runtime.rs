@@ -351,6 +351,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 "Could not create any QUIC tunnels; check resolver/domain configuration",
             ));
         }
+        pool.rebuild_cnx_index();
         info!(
             "Created {} per-route tunnels: {}",
             pool.tunnels.len(),
@@ -404,45 +405,33 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 }
             }
 
-            // ── Per-tunnel: drain stream I/O commands ────────────────
-            for tunnel in pool.tunnels.iter_mut() {
-                if tunnel.is_closing() {
-                    continue;
-                }
-                drain_commands(tunnel.cnx, tunnel.state_ptr, &mut tunnel.command_rx);
-                drain_stream_data(tunnel.cnx, tunnel.state_ptr);
-            }
-
-            // Mark closing tunnels as unhealthy so the pool skips them.
-            // Only force a full reconnect if ALL tunnels are closing/dead
-            // (handled by the all_unhealthy check later).
+            // ── Per-tunnel: pre-select housekeeping (single pass) ─────
+            // Combine closing detection, readiness updates and path
+            // events into one iteration to avoid repeated traversals.
+            // NOTE: drain_commands + drain_stream_data are intentionally
+            // deferred to the post-select section so we only pay the
+            // cost once per event-loop tick.
             for tunnel in pool.tunnels.iter_mut() {
                 if tunnel.is_closing() && tunnel.healthy {
                     warn!("{}: connection closed — marking unhealthy", tunnel.label());
                     tunnel.healthy = false;
                     balancer.suspend_route(tunnel.resolver_idx, tunnel.domain_idx);
                 }
-            }
-
-            // ── Per-tunnel readiness updates ─────────────────────────
-            for tunnel in pool.tunnels.iter_mut() {
                 if tunnel.is_ready() {
                     unsafe { (*tunnel.state_ptr).update_acceptor_limit(tunnel.cnx) };
                     if reconnect_delay != Duration::from_millis(RECONNECT_SLEEP_MIN_MS) {
                         reconnect_delay = Duration::from_millis(RECONNECT_SLEEP_MIN_MS);
                     }
                 }
-            }
-
-            // Per-tunnel path events.
-            for tunnel in pool.tunnels.iter_mut() {
-                drain_path_events(
-                    tunnel.cnx,
-                    std::slice::from_mut(&mut tunnel.resolver),
-                    tunnel.state_ptr,
-                    &mut balancer,
-                    Some(tunnel.resolver_idx),
-                );
+                if !tunnel.is_closing() {
+                    drain_path_events(
+                        tunnel.cnx,
+                        std::slice::from_mut(&mut tunnel.resolver),
+                        tunnel.state_ptr,
+                        &mut balancer,
+                        Some(tunnel.resolver_idx),
+                    );
+                }
             }
 
             // ── Periodically push per-tunnel snapshot to health checker
@@ -672,13 +661,6 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 }
                 drain_commands(tunnel.cnx, tunnel.state_ptr, &mut tunnel.command_rx);
                 drain_stream_data(tunnel.cnx, tunnel.state_ptr);
-                drain_path_events(
-                    tunnel.cnx,
-                    std::slice::from_mut(&mut tunnel.resolver),
-                    tunnel.state_ptr,
-                    &mut balancer,
-                    Some(tunnel.resolver_idx),
-                );
             }
 
             if all_closing {
@@ -820,9 +802,13 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 }
             }
 
-            // ── Per-tunnel flow-blocked detection + auto-recovery ─────
+            // ── Per-tunnel health checks (single pass) ───────────────
+            // Merge flow-blocked detection, watchdog, and stall checks
+            // to avoid iterating all tunnels three separate times.
+            let now_wd = unsafe { picoquic_current_time() };
             for tunnel in pool.tunnels.iter_mut() {
                 if !tunnel.healthy || tunnel.is_closing() {
+                    tunnel.flow_blocked_since = 0;
                     continue;
                 }
                 let has_ready_stream =
@@ -830,26 +816,23 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 let flow_blocked =
                     unsafe { slipstream_is_flow_blocked(tunnel.cnx) != 0 };
                 let streams_len = tunnel.streams_len();
-                let now = unsafe { picoquic_current_time() };
 
+                // ── Flow-blocked detection ──
                 if streams_len > 0 && has_ready_stream && flow_blocked {
-                    // Track when flow_blocked first started.
                     if tunnel.flow_blocked_since == 0 {
-                        tunnel.flow_blocked_since = now;
+                        tunnel.flow_blocked_since = now_wd;
                     }
-                    let blocked_dur = now.saturating_sub(tunnel.flow_blocked_since);
+                    let blocked_dur = now_wd.saturating_sub(tunnel.flow_blocked_since);
 
-                    if now.saturating_sub(last_flow_block_log_at) >= FLOW_BLOCKED_LOG_INTERVAL_US {
+                    if now_wd.saturating_sub(last_flow_block_log_at) >= FLOW_BLOCKED_LOG_INTERVAL_US {
                         error!(
                             "{}: flow blocked for {}s, streams={}",
                             tunnel.label(),
                             blocked_dur / 1_000_000,
                             streams_len,
                         );
-                        last_flow_block_log_at = now;
+                        last_flow_block_log_at = now_wd;
                     }
-
-                    // If stuck for too long, mark unhealthy so we reconnect.
                     if blocked_dur >= FLOW_BLOCKED_KILL_US {
                         warn!(
                             "{}: flow blocked for {}s — marking unhealthy for reconnect",
@@ -858,10 +841,49 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                         );
                         tunnel.healthy = false;
                         balancer.suspend_route(tunnel.resolver_idx, tunnel.domain_idx);
+                        continue;
                     }
                 } else {
-                    // Clear the tracker when flow is unblocked.
                     tunnel.flow_blocked_since = 0;
+                }
+
+                // ── Watchdog ──
+                if now_wd.saturating_sub(tunnel.last_activity_at) >= WATCHDOG_TIMEOUT_US {
+                    warn!(
+                        "{}: no activity for {}s; marking unhealthy",
+                        tunnel.label(),
+                        WATCHDOG_TIMEOUT_US / 1_000_000,
+                    );
+                    tunnel.healthy = false;
+                    balancer.suspend_route(tunnel.resolver_idx, tunnel.domain_idx);
+                    continue;
+                }
+
+                // ── Throughput stall ──
+                if streams_len == 0 {
+                    tunnel.stall_rx_snapshot = tunnel.resolver.debug.dns_responses;
+                    tunnel.stall_tx_snapshot = tunnel.resolver.debug.send_bytes;
+                    tunnel.stall_check_at = now_wd;
+                } else {
+                    let cur_rx = tunnel.resolver.debug.dns_responses;
+                    let cur_tx = tunnel.resolver.debug.send_bytes;
+                    if cur_rx != tunnel.stall_rx_snapshot || cur_tx != tunnel.stall_tx_snapshot {
+                        tunnel.stall_rx_snapshot = cur_rx;
+                        tunnel.stall_tx_snapshot = cur_tx;
+                        tunnel.stall_check_at = now_wd;
+                    } else {
+                        let stall_dur = now_wd.saturating_sub(tunnel.stall_check_at);
+                        if stall_dur >= THROUGHPUT_STALL_US {
+                            warn!(
+                                "{}: throughput stall for {}s with {} streams — marking unhealthy",
+                                tunnel.label(),
+                                stall_dur / 1_000_000,
+                                streams_len,
+                            );
+                            tunnel.healthy = false;
+                            balancer.suspend_route(tunnel.resolver_idx, tunnel.domain_idx);
+                        }
+                    }
                 }
             }
 
@@ -998,7 +1020,6 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
             }
 
             // ── Periodic heartbeat (diagnostics) ─────────────────────
-            let now_wd = unsafe { picoquic_current_time() };
             if now_wd.saturating_sub(last_heartbeat_at) >= HEARTBEAT_INTERVAL_US {
                 last_heartbeat_at = now_wd;
                 let healthy_count = pool.tunnels.iter().filter(|t| t.healthy).count();
@@ -1008,60 +1029,6 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                     "heartbeat: tunnels={} healthy={} ready={} streams={}",
                     pool.tunnels.len(), healthy_count, ready_count, total_streams,
                 );
-            }
-
-            // ── Per-tunnel watchdog ──────────────────────────────────
-            for tunnel in pool.tunnels.iter_mut() {
-                // Only warn once — skip tunnels already marked unhealthy.
-                if tunnel.healthy
-                    && now_wd.saturating_sub(tunnel.last_activity_at) >= WATCHDOG_TIMEOUT_US
-                {
-                    warn!(
-                        "{}: no activity for {}s; marking unhealthy",
-                        tunnel.label(),
-                        WATCHDOG_TIMEOUT_US / 1_000_000,
-                    );
-                    tunnel.healthy = false;
-                    balancer.suspend_route(tunnel.resolver_idx, tunnel.domain_idx);
-                }
-            }
-
-            // ── Per-tunnel throughput stall detection ─────────────────
-            // If a tunnel has active streams but no bytes are moving
-            // (send_bytes + dns_responses unchanged), it's stalled.
-            for tunnel in pool.tunnels.iter_mut() {
-                if !tunnel.healthy || tunnel.is_closing() {
-                    continue;
-                }
-                let streams_len = tunnel.streams_len();
-                if streams_len == 0 {
-                    // No streams → reset snapshot, nothing to stall on.
-                    tunnel.stall_rx_snapshot = tunnel.resolver.debug.dns_responses;
-                    tunnel.stall_tx_snapshot = tunnel.resolver.debug.send_bytes;
-                    tunnel.stall_check_at = now_wd;
-                    continue;
-                }
-                let cur_rx = tunnel.resolver.debug.dns_responses;
-                let cur_tx = tunnel.resolver.debug.send_bytes;
-                if cur_rx != tunnel.stall_rx_snapshot || cur_tx != tunnel.stall_tx_snapshot {
-                    // Progress — update snapshot.
-                    tunnel.stall_rx_snapshot = cur_rx;
-                    tunnel.stall_tx_snapshot = cur_tx;
-                    tunnel.stall_check_at = now_wd;
-                } else {
-                    // No progress — check how long.
-                    let stall_dur = now_wd.saturating_sub(tunnel.stall_check_at);
-                    if stall_dur >= THROUGHPUT_STALL_US {
-                        warn!(
-                            "{}: throughput stall for {}s with {} streams — marking unhealthy",
-                            tunnel.label(),
-                            stall_dur / 1_000_000,
-                            streams_len,
-                        );
-                        tunnel.healthy = false;
-                        balancer.suspend_route(tunnel.resolver_idx, tunnel.domain_idx);
-                    }
-                }
             }
 
             if pool.all_unhealthy() {

@@ -10,6 +10,7 @@
 use crate::dns::resolver::ResolverState;
 use crate::streams::{ClientState, Command};
 use slipstream_ffi::picoquic::picoquic_cnx_t;
+use std::collections::HashMap;
 use std::sync::OnceLock;
 use tokio::sync::mpsc;
 
@@ -108,6 +109,8 @@ pub(crate) struct TunnelPool {
     pub(crate) tunnels: Vec<TunnelRoute>,
     /// Round-robin cursor for weighted tunnel selection.
     rr_cursor: usize,
+    /// O(1) map from cnx pointer → tunnel index for the send loop.
+    cnx_index: HashMap<usize, usize>,
 }
 
 impl TunnelPool {
@@ -115,6 +118,15 @@ impl TunnelPool {
         Self {
             tunnels: Vec::new(),
             rr_cursor: 0,
+            cnx_index: HashMap::new(),
+        }
+    }
+
+    /// Rebuild the cnx→index map.  Call after adding tunnels.
+    pub(crate) fn rebuild_cnx_index(&mut self) {
+        self.cnx_index.clear();
+        for (i, t) in self.tunnels.iter().enumerate() {
+            self.cnx_index.insert(t.cnx as usize, i);
         }
     }
 
@@ -165,9 +177,9 @@ impl TunnelPool {
         None
     }
 
-    /// Find the tunnel that owns a specific QUIC connection.
+    /// Find the tunnel that owns a specific QUIC connection (O(1) lookup).
     pub(crate) fn find_by_cnx(&self, cnx: *mut picoquic_cnx_t) -> Option<usize> {
-        self.tunnels.iter().position(|t| t.cnx == cnx)
+        self.cnx_index.get(&(cnx as usize)).copied()
     }
 
     /// Find tunnel indices for a given resolver address.
