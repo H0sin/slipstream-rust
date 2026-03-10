@@ -554,6 +554,11 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
             let timeout = Duration::from_micros(timeout_us);
 
             // ── Async select: recv / accept / data / timeout ─────────
+            // When there is active work (streams open) we rely solely
+            // on the computed timeout to pace the loop — data_notify
+            // would fire continuously from TCP reader tasks and defeat
+            // the sleep.  We only listen to data_notify when idle so
+            // it can wake us up promptly for new data.
             tokio::select! {
                 cmd = accept_rx.recv() => {
                     if let Some(Command::NewStream { stream, reservation }) = cmd {
@@ -569,7 +574,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                         }
                     }
                 }
-                _ = data_notify.notified() => {}
+                _ = data_notify.notified(), if !has_work => {}
                 recv = udp.recv_from(&mut recv_buf) => {
                     match recv {
                         Ok((size, peer)) => {
@@ -634,21 +639,14 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 _ = sleep(timeout) => {}
             }
 
-            // ── Throttle: prevent busy-spin when data_notify fires ───
-            // data_notify can wake the loop every time a TCP read
-            // completes, bypassing the sleep timeout entirely.  Use
-            // the same computed timeout_us here so the escalation
-            // logic (consecutive_zero_delay → 20ms) still takes
-            // effect even when data_notify won the select.
+            // ── Throttle: enforce minimum gap between iterations ─────
+            // Guard against UDP recv or accept_rx winning select
+            // faster than the computed timeout.
             {
                 let elapsed = last_heavy_work_at.elapsed();
-                let min_gap = Duration::from_micros(timeout_us.max(MIN_POLL_INTERVAL_US));
+                let min_gap = Duration::from_micros(MIN_POLL_INTERVAL_US);
                 if elapsed < min_gap {
                     sleep(min_gap - elapsed).await;
-                } else {
-                    // Heavy work already exceeded the gap — still yield
-                    // so the loop never pins a core at 100%.
-                    sleep(Duration::from_micros(MIN_POLL_INTERVAL_US)).await;
                 }
                 last_heavy_work_at = std::time::Instant::now();
             }
