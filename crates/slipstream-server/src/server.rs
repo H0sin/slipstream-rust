@@ -427,14 +427,10 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
 
                 if send_length == 0 {
                     let cnx_id = slot.cnx as usize;
-                    // Fast O(1) pre-check: skip the expensive metrics scan when the
-                    // connection has no streams at all.
-                    let quick_count = unsafe { (&*state_ptr).cnx_stream_count(cnx_id) };
-                    if quick_count > 0 {
-                        let metrics = unsafe { (&*state_ptr).stream_debug_metrics(cnx_id) };
-                        if metrics.streams_total > 0
-                            && metrics.has_send_backlog()
-                        {
+                    let metrics = unsafe { (&*state_ptr).stream_debug_metrics(cnx_id) };
+                    if metrics.streams_total > 0
+                        && metrics.has_send_backlog()
+                    {
                         // Track how long this connection has been stalled.
                         let stall_start = *stall_first_seen
                             .entry(cnx_id)
@@ -495,7 +491,6 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
                         // No longer stalled — clear the tracker.
                         stall_first_seen.remove(&cnx_id);
                     }
-                    } // quick_count > 0
                 }
             }
 

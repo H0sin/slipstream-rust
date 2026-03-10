@@ -10,9 +10,8 @@ use crate::dns::{
     expire_inflight_polls, handle_dns_response_tunneled, maybe_report_debug,
     refresh_resolver_path, resolve_resolvers, resolver_mode_to_c,
     send_poll_queries, sockaddr_storage_to_socket_addr,
-    DomainBalancer, DiscoveredResolver, HealthUpdate, ScannerConfig,
+    DomainBalancer, HealthUpdate,
     TunnelSnapshot, TunneledResponseContext,
-    run_resolver_scanner,
 };
 use crate::error::ClientError;
 use crate::pacing::{cwnd_target_polls, inflight_packet_estimate};
@@ -51,6 +50,9 @@ const SLIPSTREAM_ALPN: &str = "picoquic_sample";
 const SLIPSTREAM_SNI: &str = "test.example.com";
 const DNS_WAKE_DELAY_MAX_US: i64 = 10_000_000;
 const DNS_POLL_SLICE_US: u64 = 20_000;
+/// Minimum poll interval floor to prevent busy-spinning when picoquic
+/// returns very small wake delays (e.g. during retransmit bursts).
+const MIN_POLL_INTERVAL_US: u64 = 1_000;
 const RECONNECT_SLEEP_MIN_MS: u64 = 250;
 const RECONNECT_SLEEP_MAX_MS: u64 = 5_000;
 const FLOW_BLOCKED_LOG_INTERVAL_US: u64 = 1_000_000;
@@ -165,37 +167,6 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
     drop(initial_resolvers);
     info!("Domain balancer created: {}", balancer.summary());
 
-    // Spawn background resolver scanner.
-    // Uses the specified scan file if provided and exists, otherwise falls back
-    // to built-in default ranges embedded in the binary.
-    let (scanner_tx, mut scanner_rx) = mpsc::unbounded_channel::<DiscoveredResolver>();
-    {
-        let ranges_file = config
-            .scan_file
-            .map(std::path::PathBuf::from)
-            .unwrap_or_default();
-        let cache_path = config
-            .scan_cache
-            .map(|s| std::path::PathBuf::from(s))
-            .unwrap_or_else(|| std::path::PathBuf::from("scan-cache.json"));
-        let scan_config = ScannerConfig {
-            ranges_file,
-            cache_file: cache_path,
-            domains: config.domains.to_vec(),
-            interval: Duration::from_secs(config.scan_interval_secs),
-            max_discovered: config.scan_max_resolvers,
-            mode: ResolverMode::Recursive,
-            batch_size: config.scan_batch_size,
-        };
-        let tx = scanner_tx.clone();
-        tokio::spawn(async move {
-            run_resolver_scanner(scan_config, tx).await;
-        });
-    }
-
-    // Track dynamically discovered resolvers (persists across reconnects).
-    let mut discovered_resolvers: Vec<(SocketAddr, ResolverMode)> = Vec::new();
-
     let mut reconnect_count: u64 = 0;
 
     loop {
@@ -204,7 +175,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
             return Err(ClientError::new("At least one resolver is required"));
         }
 
-        balancer.resize_resolvers(base_resolvers.len() + discovered_resolvers.len());
+        balancer.resize_resolvers(base_resolvers.len());
         if reconnect_count > 0 {
             info!(
                 "Reconnect #{}: balancer state preserved — {}",
@@ -371,107 +342,6 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
             }
         }
 
-        // ── Create tunnels for previously discovered resolvers ──────
-        for (disc_i, (disc_addr, disc_mode)) in discovered_resolvers.iter().enumerate() {
-            let ri = base_resolvers.len() + disc_i;
-            let disc_storage = socket_addr_to_storage(*disc_addr);
-            for (di, domain) in config.domains.iter().enumerate() {
-                let tunnel_id = pool.tunnels.len();
-                let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Command>();
-                let mut tunnel_state = Box::new(ClientState::new(
-                    cmd_tx,
-                    data_notify.clone(),
-                    debug_streams,
-                    acceptor.clone(),
-                ));
-                let tunnel_state_ptr: *mut ClientState = &mut *tunnel_state;
-
-                unsafe {
-                    slipstream_set_default_path_mode(resolver_mode_to_c(*disc_mode));
-                }
-
-                let mut server_storage = disc_storage;
-                let cnx = unsafe {
-                    picoquic_create_client_cnx(
-                        quic,
-                        &mut server_storage as *mut _ as *mut libc::sockaddr,
-                        current_time,
-                        0,
-                        sni.as_ptr(),
-                        alpn.as_ptr(),
-                        Some(client_callback),
-                        tunnel_state_ptr as *mut _,
-                    )
-                };
-                if cnx.is_null() {
-                    warn!(
-                        "Could not create QUIC connection for discovered tunnel[{}] (resolver={} domain={}); skipping",
-                        tunnel_id, disc_addr, domain
-                    );
-                    continue;
-                }
-
-                let mut resolver = crate::dns::resolver::ResolverState {
-                    addr: *disc_addr,
-                    storage: disc_storage,
-                    local_addr_storage: None,
-                    mode: *disc_mode,
-                    added: true,
-                    path_id: 0,
-                    unique_path_id: Some(0),
-                    probe_attempts: 0,
-                    next_probe_at: 0,
-                    pending_polls: 0,
-                    inflight_poll_ids: std::collections::HashMap::new(),
-                    pacing_budget: match disc_mode {
-                        ResolverMode::Authoritative => {
-                            Some(crate::pacing::PacingPollBudget::new(mtu))
-                        }
-                        ResolverMode::Recursive => None,
-                    },
-                    last_pacing_snapshot: None,
-                    debug: crate::dns::debug::DebugMetrics::new(config.debug_poll),
-                };
-
-                apply_path_mode(cnx, &mut resolver)?;
-
-                unsafe {
-                    picoquic_set_callback(cnx, Some(client_callback), tunnel_state_ptr as *mut _);
-                    picoquic_enable_path_callbacks(cnx, 1);
-                    if config.keep_alive_interval > 0 {
-                        picoquic_enable_keep_alive(cnx, config.keep_alive_interval as u64 * 1000);
-                    } else {
-                        picoquic_disable_keep_alive(cnx);
-                    }
-                }
-
-                pool.tunnels.push(TunnelRoute {
-                    id: tunnel_id,
-                    resolver_idx: ri,
-                    domain_idx: di,
-                    domain: domain.clone(),
-                    cnx,
-                    state_ptr: tunnel_state_ptr,
-                    command_rx: cmd_rx,
-                    resolver,
-                    dns_id: 1,
-                    healthy: true,
-                    last_activity_at: current_time,
-                    flow_blocked_since: 0,
-                    stall_rx_snapshot: 0,
-                    stall_tx_snapshot: 0,
-                    stall_check_at: current_time,
-                });
-                _tunnel_states.push(tunnel_state);
-            }
-        }
-        if !discovered_resolvers.is_empty() {
-            info!(
-                "Recreated {} discovered resolver tunnels on reconnect",
-                discovered_resolvers.len() * config.domains.len(),
-            );
-        }
-
         if pool.tunnels.is_empty() {
             return Err(ClientError::new(
                 "Could not create any QUIC tunnels; check resolver/domain configuration",
@@ -492,9 +362,14 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
         let mut zero_send_loops = 0u64;
         let mut zero_send_with_streams = 0u64;
         let mut last_flow_block_log_at = 0u64;
+        // Counts consecutive iterations where picoquic returned a zero or
+        // near-zero wake delay.  Used to apply escalating back-off so the
+        // event loop doesn't busy-spin at 100% CPU.
+        let mut consecutive_zero_delay: u32 = 0;
         let _last_activity_at = unsafe { picoquic_current_time() };
         let mut last_heartbeat_at = unsafe { picoquic_current_time() };
         let mut last_health_snapshot_at = std::time::Instant::now();
+        let mut last_heavy_work_at = std::time::Instant::now();
         const HEALTH_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(30);
 
         'inner: loop {
@@ -611,151 +486,6 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 }
             }
 
-            // ── Drain resolver scanner discoveries ───────────────────
-            while let Ok(discovered) = scanner_rx.try_recv() {
-                let addr = discovered.addr;
-
-                // Skip if already in pool (config or previously discovered).
-                if pool.tunnels.iter().any(|t| t.resolver.addr == addr) {
-                    debug!("[scanner] {} already in pool; skipping", addr);
-                    continue;
-                }
-                // Skip if it matches a config resolver.
-                if base_resolvers.iter().any(|r| r.addr == addr) {
-                    debug!("[scanner] {} is a config resolver; skipping", addr);
-                    continue;
-                }
-                // Respect the max-discovered limit.
-                if discovered_resolvers.len() >= config.scan_max_resolvers {
-                    debug!("[scanner] max discovered reached; ignoring {}", addr);
-                    continue;
-                }
-
-                info!(
-                    "[scanner] adding discovered resolver {} to pool (latency={}ms)",
-                    addr,
-                    discovered.latency.as_millis(),
-                );
-                discovered_resolvers.push((addr, discovered.mode));
-
-                let new_ri = balancer.add_resolver();
-                let disc_storage = socket_addr_to_storage(addr);
-
-                for (di, domain) in config.domains.iter().enumerate() {
-                    let tunnel_id = pool.tunnels.len();
-                    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Command>();
-                    let mut tunnel_state = Box::new(ClientState::new(
-                        cmd_tx,
-                        data_notify.clone(),
-                        debug_streams,
-                        acceptor.clone(),
-                    ));
-                    let tunnel_state_ptr: *mut ClientState = &mut *tunnel_state;
-
-                    unsafe {
-                        slipstream_set_default_path_mode(resolver_mode_to_c(discovered.mode));
-                    }
-
-                    let mut server_storage = disc_storage;
-                    let cnx = unsafe {
-                        picoquic_create_client_cnx(
-                            quic,
-                            &mut server_storage as *mut _ as *mut libc::sockaddr,
-                            current_time,
-                            0,
-                            sni.as_ptr(),
-                            alpn.as_ptr(),
-                            Some(client_callback),
-                            tunnel_state_ptr as *mut _,
-                        )
-                    };
-                    if cnx.is_null() {
-                        warn!(
-                            "[scanner] failed to create QUIC tunnel for {} domain={}; skipping",
-                            addr, domain,
-                        );
-                        // Keep state alive so the QUIC context can clean up safely.
-                        _tunnel_states.push(tunnel_state);
-                        continue;
-                    }
-
-                    let mut resolver = crate::dns::resolver::ResolverState {
-                        addr,
-                        storage: disc_storage,
-                        local_addr_storage: None,
-                        mode: discovered.mode,
-                        added: true,
-                        path_id: 0,
-                        unique_path_id: Some(0),
-                        probe_attempts: 0,
-                        next_probe_at: 0,
-                        pending_polls: 0,
-                        inflight_poll_ids: std::collections::HashMap::new(),
-                        pacing_budget: match discovered.mode {
-                            ResolverMode::Authoritative => {
-                                Some(crate::pacing::PacingPollBudget::new(mtu))
-                            }
-                            ResolverMode::Recursive => None,
-                        },
-                        last_pacing_snapshot: None,
-                        debug: crate::dns::debug::DebugMetrics::new(config.debug_poll),
-                    };
-
-                    if let Err(e) = apply_path_mode(cnx, &mut resolver) {
-                        warn!(
-                            "[scanner] apply_path_mode failed for {} domain={}: {}; skipping",
-                            addr, domain, e,
-                        );
-                        _tunnel_states.push(tunnel_state);
-                        continue;
-                    }
-
-                    unsafe {
-                        picoquic_set_callback(cnx, Some(client_callback), tunnel_state_ptr as *mut _);
-                        picoquic_enable_path_callbacks(cnx, 1);
-                        if config.keep_alive_interval > 0 {
-                            picoquic_enable_keep_alive(
-                                cnx,
-                                config.keep_alive_interval as u64 * 1000,
-                            );
-                        } else {
-                            picoquic_disable_keep_alive(cnx);
-                        }
-                    }
-
-                    pool.tunnels.push(TunnelRoute {
-                        id: tunnel_id,
-                        resolver_idx: new_ri,
-                        domain_idx: di,
-                        domain: domain.clone(),
-                        cnx,
-                        state_ptr: tunnel_state_ptr,
-                        command_rx: cmd_rx,
-                        resolver,
-                        dns_id: 1,
-                        healthy: true,
-                        last_activity_at: current_time,
-                        flow_blocked_since: 0,
-                        stall_rx_snapshot: 0,
-                        stall_tx_snapshot: 0,
-                        stall_check_at: current_time,
-                    });
-                    _tunnel_states.push(tunnel_state);
-                }
-
-                // Update burst limits for the expanded pool.
-                packet_loop_send_max =
-                    (pool.tunnels.len() * PICOQUIC_PACKET_LOOP_SEND_MAX * 2).min(PACKET_LOOP_SEND_CAP);
-                packet_loop_recv_max = pool.tunnels.len() * PICOQUIC_PACKET_LOOP_RECV_MAX * 2;
-
-                info!(
-                    "[scanner] resolver {} added as resolver_idx={}, pool: {}",
-                    addr,
-                    new_ri,
-                    pool.summary(),
-                );
-            }
-
             // ── Per-tunnel: expire inflight polls ────────────────────
             for tunnel in pool.tunnels.iter_mut() {
                 if tunnel.resolver.mode == ResolverMode::Authoritative {
@@ -800,9 +530,26 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 }
             }
             let timeout_us = if has_work {
-                delay_us.clamp(1, DNS_POLL_SLICE_US)
+                // Enforce a floor so that a zero wake-delay from picoquic
+                // (e.g. during retransmit / ack bursts on a degraded link)
+                // does not collapse the event loop into a 1 µs busy-spin.
+                let floor = if delay_us < MIN_POLL_INTERVAL_US {
+                    consecutive_zero_delay = consecutive_zero_delay.saturating_add(1);
+                    // Escalate: after 50 consecutive tight iterations, widen
+                    // the floor up to DNS_POLL_SLICE_US so the CPU can cool.
+                    if consecutive_zero_delay > 50 {
+                        DNS_POLL_SLICE_US
+                    } else {
+                        MIN_POLL_INTERVAL_US
+                    }
+                } else {
+                    consecutive_zero_delay = 0;
+                    delay_us
+                };
+                floor.clamp(MIN_POLL_INTERVAL_US, DNS_POLL_SLICE_US)
             } else {
-                delay_us.max(1)
+                consecutive_zero_delay = 0;
+                delay_us.max(MIN_POLL_INTERVAL_US)
             };
             let timeout = Duration::from_micros(timeout_us);
 
@@ -887,7 +634,27 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 _ = sleep(timeout) => {}
             }
 
+            // ── Throttle: prevent busy-spin when data_notify fires ───
+            // data_notify can wake the loop every time a TCP read
+            // completes, bypassing the sleep timeout entirely.  When
+            // the link is degraded the loop would spin at 100% CPU
+            // doing expensive send + poll work that makes no progress.
+            // Enforce a minimum gap between heavy-work iterations.
+            {
+                let elapsed = last_heavy_work_at.elapsed();
+                let min_gap = Duration::from_micros(MIN_POLL_INTERVAL_US);
+                if elapsed < min_gap {
+                    sleep(min_gap - elapsed).await;
+                }
+                last_heavy_work_at = std::time::Instant::now();
+            }
+
             // ── Post-select: drain all tunnels ───────────────────────
+            // If every tunnel is already closing/unhealthy, skip the
+            // expensive send + poll phases and jump straight to the
+            // health/watchdog checks which will trigger reconnect.
+            let all_closing = pool.tunnels.iter().all(|t| t.is_closing() || !t.healthy);
+
             for tunnel in pool.tunnels.iter_mut() {
                 if tunnel.is_closing() {
                     continue;
@@ -901,6 +668,16 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                     &mut balancer,
                     Some(tunnel.resolver_idx),
                 );
+            }
+
+            if all_closing {
+                // Nothing useful to send — check all_unhealthy at the
+                // bottom to trigger reconnect on the next iteration.
+                if pool.all_unhealthy() {
+                    warn!("All tunnels unhealthy; forcing reconnect");
+                    break 'inner;
+                }
+                continue 'inner;
             }
 
             // ── Send phase: prepare packets from shared QUIC context ─

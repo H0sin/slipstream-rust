@@ -162,7 +162,7 @@ fn main() {
         debug_commands: args.debug_commands,
     };
 
-    let runtime = Builder::new_current_thread()
+    let runtime = Builder::new_multi_thread()
         .enable_io()
         .enable_time()
         .build()

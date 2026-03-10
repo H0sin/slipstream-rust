@@ -90,11 +90,6 @@ if [[ "${1:-}" != "" ]]; then
       CONGESTION_CONTROL="${CONGESTION_CONTROL:-}"
       KEEP_ALIVE_INTERVAL="${KEEP_ALIVE_INTERVAL:-400}"
       GSO="${GSO:-}"
-      SCAN_FILE="${SCAN_FILE:-}"
-      SCAN_CACHE="${SCAN_CACHE:-/etc/slipstream/scan-cache.json}"
-      SCAN_INTERVAL="${SCAN_INTERVAL:-300}"
-      SCAN_MAX="${SCAN_MAX:-5}"
-      SCAN_BATCH="${SCAN_BATCH:-50}"
       echo ""
       echo -e "${CYAN}Current configuration:${NC}"
       echo -e "  1) Domains:            $DOMAINS"
@@ -105,11 +100,6 @@ if [[ "${1:-}" != "" ]]; then
       echo -e "  6) Congestion control: ${CONGESTION_CONTROL:-(default)}"
       echo -e "  7) Keep-alive (ms):    $KEEP_ALIVE_INTERVAL"
       echo -e "  8) GSO:                ${GSO:-off}"
-      echo -e "  9) Scan file:          ${SCAN_FILE:-(built-in)}"
-      echo -e " 10) Scan cache:         $SCAN_CACHE"
-      echo -e " 11) Scan interval (s):  $SCAN_INTERVAL"
-      echo -e " 12) Scan max resolvers: $SCAN_MAX"
-      echo -e " 13) Scan batch size:    $SCAN_BATCH"
       echo ""
       ask "Enter field numbers to edit (e.g. 1 2) or 'all', empty to cancel"
       read -r EDIT_CHOICE < /dev/tty
@@ -155,26 +145,6 @@ if [[ "${1:-}" != "" ]]; then
         ask "Enable GSO? (on/off) [${GSO:-off}]"
         read -r NEW_VAL < /dev/tty; [[ -n "$NEW_VAL" ]] && GSO="$NEW_VAL"
       fi
-      if [[ "$EDIT_CHOICE" == *"9"* ]] || [[ "$EDIT_CHOICE" == "all" ]]; then
-        ask "Scan file path [$SCAN_FILE]"
-        read -r NEW_VAL < /dev/tty; [[ -n "$NEW_VAL" ]] && SCAN_FILE="$NEW_VAL"
-      fi
-      if [[ "$EDIT_CHOICE" == *"10"* ]] || [[ "$EDIT_CHOICE" == "all" ]]; then
-        ask "Scan cache file [$SCAN_CACHE]"
-        read -r NEW_VAL < /dev/tty; [[ -n "$NEW_VAL" ]] && SCAN_CACHE="$NEW_VAL"
-      fi
-      if [[ "$EDIT_CHOICE" == *"11"* ]] || [[ "$EDIT_CHOICE" == "all" ]]; then
-        ask "Scan interval in seconds [$SCAN_INTERVAL]"
-        read -r NEW_VAL < /dev/tty; [[ -n "$NEW_VAL" ]] && SCAN_INTERVAL="$NEW_VAL"
-      fi
-      if [[ "$EDIT_CHOICE" == *"12"* ]] || [[ "$EDIT_CHOICE" == "all" ]]; then
-        ask "Max resolvers to discover [$SCAN_MAX]"
-        read -r NEW_VAL < /dev/tty; [[ -n "$NEW_VAL" ]] && SCAN_MAX="$NEW_VAL"
-      fi
-      if [[ "$EDIT_CHOICE" == *"13"* ]] || [[ "$EDIT_CHOICE" == "all" ]]; then
-        ask "IPs per scan batch [$SCAN_BATCH]"
-        read -r NEW_VAL < /dev/tty; [[ -n "$NEW_VAL" ]] && SCAN_BATCH="$NEW_VAL"
-      fi
       if [[ -z "$RESOLVERS" ]] && [[ -z "$AUTHORITATIVES" ]]; then
         err "At least one resolver or authoritative address is required."
         exit 1
@@ -188,11 +158,6 @@ if [[ "${1:-}" != "" ]]; then
       [[ -n "$CONGESTION_CONTROL" ]] && EXTRA_ARGS="$EXTRA_ARGS --congestion-control $CONGESTION_CONTROL"
       [[ -n "$KEEP_ALIVE_INTERVAL" && "$KEEP_ALIVE_INTERVAL" != "400" ]] && EXTRA_ARGS="$EXTRA_ARGS --keep-alive-interval $KEEP_ALIVE_INTERVAL"
       [[ "$GSO" == "on" ]] && EXTRA_ARGS="$EXTRA_ARGS --gso"
-      [[ -n "$SCAN_FILE" ]] && EXTRA_ARGS="$EXTRA_ARGS --scan-file $SCAN_FILE"
-      [[ -n "$SCAN_CACHE" ]] && EXTRA_ARGS="$EXTRA_ARGS --scan-cache $SCAN_CACHE"
-      [[ -n "$SCAN_INTERVAL" && "$SCAN_INTERVAL" != "300" ]] && EXTRA_ARGS="$EXTRA_ARGS --scan-interval $SCAN_INTERVAL"
-      [[ -n "$SCAN_MAX" && "$SCAN_MAX" != "5" ]] && EXTRA_ARGS="$EXTRA_ARGS --scan-max $SCAN_MAX"
-      [[ -n "$SCAN_BATCH" && "$SCAN_BATCH" != "50" ]] && EXTRA_ARGS="$EXTRA_ARGS --scan-batch $SCAN_BATCH"
       cat > "$CONF_FILE" <<EOFCONF
 DOMAINS=$DOMAINS
 RESOLVERS=$RESOLVERS
@@ -202,11 +167,6 @@ LISTEN_HOST=$LISTEN_HOST
 CONGESTION_CONTROL=$CONGESTION_CONTROL
 KEEP_ALIVE_INTERVAL=$KEEP_ALIVE_INTERVAL
 GSO=$GSO
-SCAN_FILE=$SCAN_FILE
-SCAN_CACHE=$SCAN_CACHE
-SCAN_INTERVAL=$SCAN_INTERVAL
-SCAN_MAX=$SCAN_MAX
-SCAN_BATCH=$SCAN_BATCH
 DOWNLOAD_BASE=${DOWNLOAD_BASE:-}
 EOFCONF
       cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOFSVC
@@ -292,11 +252,6 @@ if [[ -f "$BIN_DIR/slipstream-client" ]] && [[ -f "/etc/systemd/system/${SERVICE
     CONGESTION_CONTROL="${CONGESTION_CONTROL:-}"
     KEEP_ALIVE_INTERVAL="${KEEP_ALIVE_INTERVAL:-400}"
     GSO="${GSO:-}"
-    SCAN_FILE="${SCAN_FILE:-}"
-    SCAN_CACHE="${SCAN_CACHE:-scan-cache.json}"
-    SCAN_INTERVAL="${SCAN_INTERVAL:-300}"
-    SCAN_MAX="${SCAN_MAX:-5}"
-    SCAN_BATCH="${SCAN_BATCH:-50}"
     echo -e "  Domains:         ${GREEN}$DOMAINS${NC}"
     echo -e "  Resolvers:       ${RESOLVERS:-(none)}"
     echo -e "  Authoritatives:  ${AUTHORITATIVES:-(none)}"
@@ -304,11 +259,6 @@ if [[ -f "$BIN_DIR/slipstream-client" ]] && [[ -f "/etc/systemd/system/${SERVICE
     echo -e "  CC:              ${CONGESTION_CONTROL:-(default)}"
     echo -e "  Keep-alive:      ${KEEP_ALIVE_INTERVAL}ms"
     echo -e "  GSO:             ${GSO:-off}"
-    echo -e "  Scan file:       ${SCAN_FILE:-(built-in)}"
-    echo -e "  Scan cache:      $SCAN_CACHE"
-    echo -e "  Scan interval:   ${SCAN_INTERVAL}s"
-    echo -e "  Scan max:        $SCAN_MAX"
-    echo -e "  Scan batch:      $SCAN_BATCH"
     echo ""
   fi
   echo -e "  ${YELLOW}Commands:${NC}"
@@ -382,25 +332,6 @@ ask "Enable GSO? (on/off) [default: off]"
 read -r GSO < /dev/tty
 GSO="${GSO:-off}"
 
-ask "Scan ranges file path (leave empty to use built-in defaults)"
-read -r SCAN_FILE < /dev/tty
-
-ask "Scan cache file [default: /etc/slipstream/scan-cache.json]"
-read -r SCAN_CACHE < /dev/tty
-SCAN_CACHE="${SCAN_CACHE:-/etc/slipstream/scan-cache.json}"
-
-ask "Scan interval in seconds [default: 300]"
-read -r SCAN_INTERVAL < /dev/tty
-SCAN_INTERVAL="${SCAN_INTERVAL:-300}"
-
-ask "Max resolvers to discover [default: 5]"
-read -r SCAN_MAX < /dev/tty
-SCAN_MAX="${SCAN_MAX:-5}"
-
-ask "IPs per scan batch [default: 50]"
-read -r SCAN_BATCH < /dev/tty
-SCAN_BATCH="${SCAN_BATCH:-50}"
-
 DOMAIN_ARGS=$(build_domain_args "$DOMAINS")
 RESOLVER_ARGS=""
 [[ -n "$RESOLVERS" ]] && RESOLVER_ARGS=$(build_resolver_args "$RESOLVERS")
@@ -410,11 +341,6 @@ EXTRA_ARGS=""
 [[ -n "$CONGESTION_CONTROL" ]] && EXTRA_ARGS="$EXTRA_ARGS --congestion-control $CONGESTION_CONTROL"
 [[ -n "$KEEP_ALIVE_INTERVAL" && "$KEEP_ALIVE_INTERVAL" != "400" ]] && EXTRA_ARGS="$EXTRA_ARGS --keep-alive-interval $KEEP_ALIVE_INTERVAL"
 [[ "$GSO" == "on" ]] && EXTRA_ARGS="$EXTRA_ARGS --gso"
-[[ -n "$SCAN_FILE" ]] && EXTRA_ARGS="$EXTRA_ARGS --scan-file $SCAN_FILE"
-[[ -n "$SCAN_CACHE" ]] && EXTRA_ARGS="$EXTRA_ARGS --scan-cache $SCAN_CACHE"
-[[ -n "$SCAN_INTERVAL" && "$SCAN_INTERVAL" != "300" ]] && EXTRA_ARGS="$EXTRA_ARGS --scan-interval $SCAN_INTERVAL"
-[[ -n "$SCAN_MAX" && "$SCAN_MAX" != "5" ]] && EXTRA_ARGS="$EXTRA_ARGS --scan-max $SCAN_MAX"
-[[ -n "$SCAN_BATCH" && "$SCAN_BATCH" != "50" ]] && EXTRA_ARGS="$EXTRA_ARGS --scan-batch $SCAN_BATCH"
 
 # Save config.
 cat > "$CONF_FILE" <<EOF
@@ -426,11 +352,6 @@ LISTEN_HOST=$LISTEN_HOST
 CONGESTION_CONTROL=$CONGESTION_CONTROL
 KEEP_ALIVE_INTERVAL=$KEEP_ALIVE_INTERVAL
 GSO=$GSO
-SCAN_FILE=$SCAN_FILE
-SCAN_CACHE=$SCAN_CACHE
-SCAN_INTERVAL=$SCAN_INTERVAL
-SCAN_MAX=$SCAN_MAX
-SCAN_BATCH=$SCAN_BATCH
 DOWNLOAD_BASE=$DOWNLOAD_BASE
 EOF
 
@@ -478,11 +399,6 @@ echo -e "  Listen:          $LISTEN_HOST:$LISTEN_PORT"
 echo -e "  CC:              ${CONGESTION_CONTROL:-(default)}"
 echo -e "  Keep-alive:      ${KEEP_ALIVE_INTERVAL}ms"
 echo -e "  GSO:             ${GSO:-off}"
-echo -e "  Scan file:       ${SCAN_FILE:-(built-in)}"
-echo -e "  Scan cache:      $SCAN_CACHE"
-echo -e "  Scan interval:   ${SCAN_INTERVAL}s"
-echo -e "  Scan max:        $SCAN_MAX"
-echo -e "  Scan batch:      $SCAN_BATCH"
 echo ""
 echo -e "  ${YELLOW}Management:${NC}"
 echo -e "  slipstream-cli status"
